@@ -1,6 +1,5 @@
 name: epa-orchestrator
 base: core26
-build-base: devel
 version: "2026.1"
 license: Apache-2.0
 summary: NUMA-aware CPU and hugepage resource orchestrator for snaps
@@ -23,7 +22,7 @@ description: |
     - Persistent state with atomic writes and file locking
     - Secure local-only Unix socket API with versioned JSON protocol
 
-grade: devel
+grade: stable
 confinement: strict
 
 apps:
