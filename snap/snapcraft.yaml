@@ -1,6 +1,7 @@
 name: epa-orchestrator
 base: core26
 version: "2026.1"
+adopt-info: snap-version
 license: Apache-2.0
 summary: NUMA-aware CPU and hugepage resource orchestrator for snaps
 source-code:
@@ -45,6 +46,21 @@ apps:
     timer: 00:00
 
 parts:
+  snap-version:
+    plugin: nil
+    build-packages:
+      - git
+    override-build: |
+      set -eu
+      craftctl default
+      gitref="$(git -C "$CRAFT_PROJECT_DIR" rev-parse --short=8 HEAD)"
+      version="$(craftctl get version)-${gitref}"
+      git -C "$CRAFT_PROJECT_DIR" update-index -q --refresh
+      if ! git -C "$CRAFT_PROJECT_DIR" diff-index --quiet HEAD --; then
+        version="${version}+dirty"
+      fi
+      craftctl set version="${version}"
+
   bin:
     source: bin/
     plugin: dump
