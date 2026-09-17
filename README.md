@@ -9,17 +9,31 @@ This repository contains the source for the EPA Orchestrator snap.
 - **CPU Pinning and Allocation**: Allocate isolated and shared CPU sets to snaps and workloads, supporting both dedicated and shared CPU usage models with basic system-size heuristics.
 - **Memory Management and Hugepage Tracking**: Introspect NUMA hugepages and track hugepage allocations across NUMA nodes with per-service allocation tracking.
 - **NUMA-Aware Core Allocation**: Request a specific number of cores from a particular NUMA node with override/append semantics and exact-count guarantees.
+- **Non-preemptive CPU Ownership**: Opt in with `preemption_policy: "non-preemptive"` to retain claims until coordinated owner release/replacement, independently of NUMA placement. [Client and recovery contract](docs/nonpreemptive-allocations.md).
 - **Resource Introspection**: Query current allocations and available resources via a secure API.
 - **Secure Unix Socket API**: All orchestration actions are performed via a secure, local Unix socket with JSON-based requests and responses.
 - **Basic Allocation Heuristics**: Automatic allocation based on system size (small vs large systems) when no specific core count is requested.
 
+### Non-preemptive Client Requests
+
+Before allocating, require `non-preemptive-allocations` in the `list_allocations`
+response's `supported_cpu_features`. Send `preemption_policy: "non-preemptive"`
+and verify that exact policy in the successful response before applying affinity.
+Older daemons ignore unknown request fields, so the request field alone is unsafe.
+Existing clients retain legacy behavior; omitted policy inherits existing protection.
+See the [integration, release, downgrade, and recovery guide](docs/nonpreemptive-allocations.md).
+Protection works with either the default isolated pool or an explicitly configured
+ordinary CPU pool. Selection, pool-conflict validation, ownership changes and the
+final online check share one state transaction; a persistence failure returns an
+error, never a successful grant. See [combined validation](docs/allocation-integration-validation.md).
+
 ### CPU Allocation by Percentage
 
-Use the `allocate_cores_percent` action to request a percentage (0–100) of isolated cores. The orchestrator computes the core count from the total isolated CPU pool (ceiling-rounded so small percentages yield at least 1 core). Use `percent: 0` or `percent: -1` to deallocate.
+Use the `allocate_cores_percent` action to request a percentage (0–100) of the eligible CPU pool. The orchestrator computes the count from the complete eligible pool, not the currently free CPUs (ceiling-rounded so small percentages yield at least 1 logical CPU). A request fails if other owners leave insufficient capacity. Use `percent: 0` or `percent: -1` to deallocate.
 
 ### CPU Allocation Policy: Small vs. Large Systems
 
-When a client requests core allocation with `num_of_cores: 0`, EPA Orchestrator applies a policy based on the total number of CPUs detected:
+When a client requests core allocation with `num_of_cores: 0`, EPA Orchestrator applies the existing heuristic to eligible CPUs available to that service (including its own previous allocation, excluding other owners):
 
 - **Small systems (≤100 CPUs):**
   - By default, 80% of the available CPUs are allocated to the requesting snap or workload.
@@ -28,16 +42,16 @@ When a client requests core allocation with `num_of_cores: 0`, EPA Orchestrator 
   - By default, 16 CPUs are always reserved (left unallocated/shared).
   - All other CPUs are allocated to the requesting snap or workload.
 
-This policy ensures that on large servers, a fixed number of CPUs are always available for system or shared use, while on smaller systems, a proportional allocation is used.
+This heuristic leaves CPUs unallocated within EPA's accounting; it does not reserve CPUs against other host workloads.
 
 ### NUMA-Aware Core Allocation Policy
 
 The NUMA-aware allocation action allows services to request a specific number of cores from a particular NUMA node:
 
 - **NUMA Locality**: Cores are allocated from the specified NUMA node to ensure optimal memory access patterns.
-- **Force Reallocation**: NUMA allocation will override any existing non-explicit allocations to other services, even if they span multiple NUMA nodes.
+- **Legacy Reallocation**: Legacy NUMA requests may reclaim non-explicit legacy allocations from other services. Non-preemptive requests never reclaim foreign claims, and protected claims cannot be reclaimed by any requester.
 - **Atomic Exact-Count**: If fewer than the requested number of cores are available in the NUMA node, the request fails with an error; no partial allocation occurs.
-- **Priority System**: NUMA allocations take precedence over automatic allocations and cannot be overridden by other services.
+- **Protection**: Explicit NUMA allocations remain protected from other services. Non-preemptive policy additionally protects ordinary/percentage claims.
 - **Per-NUMA override/append semantics**: If the same service requests the same NUMA node again, it overrides previous cores from that node. If it requests a different NUMA node, the new cores are appended so the service may hold allocations across multiple NUMA nodes.
 - **Per-NUMA deallocation**: Sending `num_of_cores = -1` for a node deallocates any existing cores for that service in that node. `num_of_cores = 0` is invalid for NUMA.
  - **SMT/Hyperthreading-aware allocation**: Within the requested NUMA node, allocation prefers full physical cores (both hyperthreads) when available, and then fills any remainder with single logical CPUs from other cores.
@@ -58,7 +72,64 @@ The snap runs a daemon that listens on a Unix domain socket and provides a JSON 
 
 ## Configuration Reference
 
-The EPA Orchestrator snap does not require complex configuration for basic operation. However, it can be integrated with other snaps (e.g., openstack-hypervisor) via the slot/plug mechanism for EPA information sharing.
+The snap can be integrated with other snaps (e.g., openstack-hypervisor) via the slot/plug mechanism for EPA information sharing.
+
+### CPU allocation pool (`cpu-pool`)
+
+By default (unset or `isolated`), EPA uses the CPUs listed in
+`/sys/devices/system/cpu/isolated`. An empty isolated list means zero capacity;
+there is **no fallback to all host CPUs**. To allocate ordinary online CPUs instead:
+
+```sh
+sudo snap set epa-orchestrator cpu-pool='2-15,18-31'
+sudo snap restart epa-orchestrator.daemon
+```
+
+Choose CPU IDs present on your machine. Lists accept non-negative IDs and inclusive
+ranges; ordering, duplicates and surrounding whitespace are normalized. Empty
+components, descending ranges, negative IDs, nonexistent CPUs and kernel stride/group
+expressions are rejected. An explicit empty string is invalid. Restore the default with:
+
+```sh
+sudo snap unset epa-orchestrator cpu-pool
+sudo snap restart epa-orchestrator.daemon
+```
+
+The configured pool is fixed at daemon startup. Online status is refreshed per request:
+`eligible = configured ∩ online`, `free = eligible − claimed`. Offline configured CPUs
+remain in the configuration but cannot be granted. A final online check rejects a
+selected CPU that became unavailable with an error asking the client to retry, without
+changing allocations. CPUs can still go offline after a successful response.
+
+**Pool eligibility is accounting, not kernel isolation.** EPA does not activate scheduler
+isolation or IRQ isolation. CPU affinity, IRQ placement, kernel housekeeping and exclusion
+of unrelated host workloads remain deployment responsibilities. Counts are logical CPUs;
+NUMA placement retains sibling-aware selection but never adds siblings outside the pool.
+
+Before shrinking a pool (including returning to `isolated`), coordinate workload release
+or migration. The configure hook rejects settings that exclude any saved owner, even if
+that CPU is offline. Supersets are allowed. A claim made between hook validation and restart
+can still conflict: the restarted daemon then serves listing/releases but blocks new CPU
+allocations until the conflict is resolved. No claims are erased. Full-service release
+(`allocate_cores` with `num_of_cores: -1`, or percentage `0`/`-1`) works with an empty pool.
+NUMA release ignores pool membership but requires node topology; if topology disappears,
+use full-service release. Replacing a service with unavailable existing claims is
+rejected rather than silently discarding those claims: explicitly coordinate their
+release first. An uncertain state commit blocks all mutations, including releases,
+until the documented storage recovery procedure completes.
+
+Capacity fields retain their names:
+
+- `total_available_cpus`: the complete eligible pool size, including owned CPUs.
+- `remaining_available_cpus`: unclaimed eligible CPUs; never negative.
+- `total_allocated_cpus`: all recorded claims, including currently unavailable CPUs, so
+  it can exceed current capacity. Offlining does not release ownership; a returning CPU
+  remains owned.
+- `shared_cpus`: unallocated eligible CPUs, **not** all remaining host CPUs.
+- `list_allocations.cpu_pool`: active source (`isolated` or `configured`),
+  `configured_cpus`, `eligible_cpus`, and `unavailable_allocated_cpus`, using normalized
+  CPU range strings. This reports the daemon's active choice, not a pending snap setting.
+  Saved allocations remain visible even when no CPUs are eligible.
 
 ### API Usage
 
@@ -83,7 +154,7 @@ Request CPU allocation for a specific service:
 }
 ```
 
-- `num_of_cores`: Number of cores to allocate. `0` (80% of total CPUs).
+- `num_of_cores`: Number of logical CPUs to allocate. `0` uses the small/large-system heuristic; `-1` releases all of this service's CPU claims.
 - `numa_node` is not allowed for this action and will be rejected.
 
 #### Response Example (Success)
@@ -112,7 +183,7 @@ Request CPU allocation for a specific service:
 
 #### 2. Allocate Cores Percent (`allocate_cores_percent`)
 
-Request CPU allocation as a percentage of isolated cores:
+Request CPU allocation as a percentage of the eligible pool:
 
 ```json
 {
@@ -123,7 +194,7 @@ Request CPU allocation as a percentage of isolated cores:
 }
 ```
 
-- `percent`: Percentage of isolated cores to allocate (1–100). Use `0` or `-1` to deallocate the service's cores.
+- `percent`: Percentage of eligible CPUs to allocate (1–100). Use `0` or `-1` to deallocate the service's cores.
 
 #### Response Example (Success)
 
@@ -186,7 +257,7 @@ Request a specific number of cores from a particular NUMA node:
 ```json
 {
   "version": "1.0",
-  "error": "NUMA node 1 only has 3 isolated CPUs, but 5 were requested"
+  "error": "NUMA node 1 only has 3 eligible CPUs, but 5 were requested"
 }
 ```
 
@@ -225,6 +296,12 @@ Get all current service allocations:
   "total_allocated_cpus": 4,
   "total_available_cpus": 20,
   "remaining_available_cpus": 16,
+  "cpu_pool": {
+    "source": "isolated",
+    "configured_cpus": "0-19",
+    "eligible_cpus": "0-19",
+    "unavailable_allocated_cpus": ""
+  },
   "allocations": [
     {
       "service_name": "my-service",
@@ -242,7 +319,7 @@ Get all current service allocations:
 }
 ```
 
-#### Response Example (No Isolated CPUs)
+#### Response Example (Empty Default Pool, No Saved Owners)
 
 ```json
 {
@@ -251,6 +328,12 @@ Get all current service allocations:
   "total_allocated_cpus": 0,
   "total_available_cpus": 0,
   "remaining_available_cpus": 0,
+  "cpu_pool": {
+    "source": "isolated",
+    "configured_cpus": "",
+    "eligible_cpus": "",
+    "unavailable_allocated_cpus": ""
+  },
   "allocations": []
 }
 ```
@@ -364,7 +447,7 @@ To build and test the snap, see CONTRIBUTING.md for full details. Typical steps:
 
 ```bash
 # Build the snap
-snapcraft --use-lxd
+snapcraft -v pack --use-lxd
 
 # Install the snap
 sudo snap install --dangerous epa-orchestrator_*.snap
@@ -384,6 +467,18 @@ tox -e mypy
 ```
 
 **Note:** Functional tests require sudo privileges for snap installation and management.
+The configured-pool success tests opt in with `EPA_TEST_CPU_POOL` and must run in a
+disposable guest with an empty isolated list, a matching active pool on NUMA node 0,
+and free capacity:
+
+```sh
+EPA_TEST_CPU_POOL=2-5 SOCKET_PATH=/var/snap/epa-orchestrator/current/data/epa.sock \
+  python3 -m pytest tests/functional -v --import-mode=importlib --confcutdir=tests/functional
+```
+
+These tests require successful grants and verify returned CPU IDs; they do not
+accept no-CPU errors. See [CPU pool validation](docs/cpu-pool-validation.md) for
+installed-snap evidence and remaining release dependencies.
 
 ## Contributing
 
