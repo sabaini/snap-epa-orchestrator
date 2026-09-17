@@ -4,7 +4,8 @@ import logging
 import os
 import socket
 
-from epa_orchestrator.daemon_handler import handle_daemon_request
+from epa_orchestrator.cpu_pool import CpuPoolProvider, read_snap_cpu_pool
+from epa_orchestrator.daemon_handler import handle_daemon_request, validate_startup_pool
 from epa_orchestrator.log import setup_logging
 
 SOCKET_FILENAME = "epa.sock"
@@ -13,6 +14,8 @@ SOCKET_PATH = os.path.join(os.environ["SNAP_DATA"], "data", SOCKET_FILENAME)
 
 def main():
     setup_logging()
+    pool_provider = CpuPoolProvider(read_snap_cpu_pool())
+    validate_startup_pool(pool_provider)
 
     os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
 
@@ -31,7 +34,7 @@ def main():
                 data = conn.recv(1024)
                 if not data:
                     continue
-                response_bytes = handle_daemon_request(data)
+                response_bytes = handle_daemon_request(data, pool_provider)
                 conn.sendall(response_bytes)
 
 

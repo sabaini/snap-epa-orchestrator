@@ -45,6 +45,13 @@ apps:
     daemon: oneshot
     timer: 00:00
 
+hooks:
+  configure:
+    environment:
+      PYTHONPATH: $SNAP/lib/python3.14/site-packages
+    plugs:
+      - sys-devices-system-node
+
 parts:
   snap-version:
     plugin: nil
