@@ -6,12 +6,13 @@
 import json
 import logging
 import math
+from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union, cast
 
 from pydantic import BaseModel, ValidationError
 
-from epa_orchestrator.allocations_db import allocations_db
-from epa_orchestrator.cpu_pinning import calculate_cpu_pinning, get_isolated_cpus
+from epa_orchestrator.allocations_db import AllocationsDB, allocations_db
+from epa_orchestrator.cpu_pool import CpuPoolProvider, CpuPoolSnapshot
 from epa_orchestrator.hugepages_db import (
     list_allocations_for_node,
     remove_allocation_for_key,
@@ -28,13 +29,13 @@ from epa_orchestrator.schemas import (
     AllocateHugepagesResponse,
     AllocateNumaCoresRequest,
     AllocateNumaCoresResponse,
+    CpuPoolInfo,
     ErrorResponse,
     GetMemoryInfoRequest,
     ListAllocationsRequest,
     ListAllocationsResponse,
     MemoryInfoResponse,
     NodeHugepagesInfo,
-    SnapAllocation,
 )
 from epa_orchestrator.state_store import StateCorruptionError
 from epa_orchestrator.utils import (
@@ -83,16 +84,50 @@ def _get_hugepages_context(
     return free, existing_count
 
 
-def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresResponse:
-    """Handle allocate cores action (non-NUMA)."""
-    isolated = get_isolated_cpus()
-    if not isolated:
-        raise ValueError("No CPUs available")
+_default_pool_provider: Optional[CpuPoolProvider] = None
+
+
+def get_cpu_pool_provider() -> CpuPoolProvider:
+    """Lazily construct an isolated-mode provider for source-checkout callers."""
+    global _default_pool_provider
+    if _default_pool_provider is None:
+        _default_pool_provider = CpuPoolProvider()
+    return _default_pool_provider
+
+
+def validate_startup_pool(provider: CpuPoolProvider) -> None:
+    """Log pool/claim conflicts but keep introspection and releases available."""
+    try:
+        provider.validate_claims(allocations_db.get_claimed_cpus())
+    except ValueError as exc:
+        logging.error("New CPU allocations blocked: %s", exc)
+
+
+def handle_allocate_cores(
+    request: AllocateCoresRequest,
+    pool_provider: Optional[CpuPoolProvider] = None,
+    snapshot: Optional[CpuPoolSnapshot] = None,
+) -> AllocateCoresResponse:
+    """Allocate using one pool snapshot and one locked ownership transaction."""
+    provider = pool_provider or get_cpu_pool_provider()
+    return allocations_db.transaction(
+        lambda db: _allocate_cores(request, db, provider, snapshot or provider.snapshot())
+    )
+
+
+def _allocate_cores(
+    request: AllocateCoresRequest,
+    db: AllocationsDB,
+    provider: CpuPoolProvider,
+    pool: CpuPoolSnapshot,
+) -> AllocateCoresResponse:
+    """Build a response from the candidate which must be committed before success."""
+    eligible = to_ranges(sorted(pool.eligible_cpus))
 
     if request.num_of_cores == -1:
-        allocations_db.remove_allocation(request.service_name)
-        stats = allocations_db.get_system_stats(isolated)
-        remaining_available = allocations_db.get_available_cpus(isolated)
+        db.remove_allocation(request.service_name)
+        stats = db.get_system_stats(eligible)
+        remaining_available = db.get_available_cpus(eligible)
         remaining_shared = to_ranges(remaining_available)
         return AllocateCoresResponse(
             service_name=request.service_name,
@@ -104,28 +139,20 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
             remaining_available_cpus=stats["remaining_available_cpus"],
         )
 
-    # Get requested number of cores (default policy when 0)
+    provider.validate_claims(db.get_claimed_cpus())
+    if not pool.eligible_cpus:
+        raise ValueError("No CPUs available")
+
     num_of_cores = request.num_of_cores or 0
-    # Use pool that includes this service's existing allocation (we are replacing it)
-    available_cpus = allocations_db.get_available_cpus_for_service(request.service_name, isolated)
-    # Check if we can allocate the requested CPUs when > 0
-    if num_of_cores > 0:
-        if len(available_cpus) < num_of_cores:
-            raise ValueError(
-                f"Insufficient CPUs available. Requested: {num_of_cores}, Available: {len(available_cpus)}"
-            )
+    shared, dedicated = db.allocate_count(
+        request.service_name,
+        num_of_cores,
+        eligible,
+        request.preemption_policy,
+        check_online=provider.check_online,
+    )
 
-    # Calculate CPU allocation
-    shared, dedicated = calculate_cpu_pinning(to_ranges(available_cpus), num_of_cores)
-
-    if not dedicated:
-        raise ValueError(f"Failed to allocate {num_of_cores} cores")
-
-    # Store the allocation in the database
-    allocations_db.allocate_cores(request.service_name, dedicated)
-
-    # Get updated statistics after allocation
-    updated_stats = allocations_db.get_system_stats(isolated)
+    updated_stats = db.get_system_stats(eligible)
     cores_allocated = _count_cpus_in_ranges(dedicated)
 
     return AllocateCoresResponse(
@@ -133,6 +160,7 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
         num_of_cores=num_of_cores,
         cores_allocated=cores_allocated,
         allocated_cores=dedicated,
+        preemption_policy=db.get_preemption_policy(request.service_name),
         shared_cpus=shared,
         total_available_cpus=updated_stats["total_available_cpus"],
         remaining_available_cpus=updated_stats["remaining_available_cpus"],
@@ -141,30 +169,47 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
 
 def handle_allocate_cores_percent(
     request: AllocateCoresPercentRequest,
+    pool_provider: Optional[CpuPoolProvider] = None,
 ) -> AllocateCoresPercentResponse:
-    """Allocate a percentage of isolated cores.
+    """Allocate a percentage of the complete eligible pool.
 
     If percent is -1, deallocate the service's cores.
     If percent is 0, treat as deallocate.
-    Otherwise, allocate the percentage of isolated cores.
+    Otherwise, allocate the percentage of eligible CPUs, not free CPUs.
     The computed core count is ceiling-rounded so small positive percentages
     (e.g. 1% of 8 cores) yield at least 1 core and never fall back to num_of_cores=0.
     """
-    isolated_count = len(parse_cpu_ranges(get_isolated_cpus()))
+    provider = pool_provider or get_cpu_pool_provider()
+    return allocations_db.transaction(
+        lambda db: _allocate_cores_percent(request, db, provider, provider.snapshot())
+    )
+
+
+def _allocate_cores_percent(
+    request: AllocateCoresPercentRequest,
+    db: AllocationsDB,
+    provider: CpuPoolProvider,
+    snapshot: CpuPoolSnapshot,
+) -> AllocateCoresPercentResponse:
+    """Use the same pool and ledger snapshot for percentage conversion and selection."""
     num_of_cores = (
-        -1 if request.percent in (-1, 0) else math.ceil(isolated_count * request.percent / 100)
+        -1
+        if request.percent in (-1, 0)
+        else math.ceil(len(snapshot.eligible_cpus) * request.percent / 100)
     )
 
     core_req = AllocateCoresRequest(
         service_name=request.service_name,
         action=ActionType.ALLOCATE_CORES,
         num_of_cores=num_of_cores,
+        preemption_policy=request.preemption_policy,
     )
-    result = handle_allocate_cores(core_req)
+    result = _allocate_cores(core_req, db, provider, snapshot)
     return AllocateCoresPercentResponse(
         version=result.version,
         service_name=result.service_name,
         cores_allocated_count=result.cores_allocated,
+        preemption_policy=result.preemption_policy,
         allocated_cores=result.allocated_cores,
         total_available_cpus=result.total_available_cpus,
         remaining_available_cpus=result.remaining_available_cpus,
@@ -173,17 +218,30 @@ def handle_allocate_cores_percent(
 
 def handle_allocate_numa_cores(
     request: AllocateNumaCoresRequest,
+    pool_provider: Optional[CpuPoolProvider] = None,
 ) -> AllocateNumaCoresResponse:
     """Handle allocate NUMA cores action.
 
     Supports exact-count allocation and per-node deallocation with num_of_cores = -1.
     """
-    # Validate num_of_cores semantics for NUMA
+    provider = pool_provider or get_cpu_pool_provider()
+    return allocations_db.transaction(
+        lambda db: _allocate_numa_cores(request, db, provider, provider.snapshot())
+    )
+
+
+def _allocate_numa_cores(
+    request: AllocateNumaCoresRequest,
+    db: AllocationsDB,
+    provider: CpuPoolProvider,
+    pool: CpuPoolSnapshot,
+) -> AllocateNumaCoresResponse:
+    """Validate pool/ownership and construct the committed NUMA response under lock."""
     if request.num_of_cores == 0:
         raise ValueError("num_of_cores=0 is invalid for allocate_numa_cores")
 
-    isolated = get_isolated_cpus()
-    stats = allocations_db.get_system_stats(isolated)
+    eligible = to_ranges(sorted(pool.eligible_cpus))
+    stats = db.get_system_stats(eligible)
     numa_cpus = get_numa_node_cpus()
 
     if request.numa_node not in numa_cpus:
@@ -191,36 +249,48 @@ def handle_allocate_numa_cores(
 
     if request.num_of_cores == -1:
         # Deallocate any existing cores for this service in the specified node
-        allocated_cores, _ = allocations_db.allocate_numa_cores(
-            request.service_name, request.numa_node, request.num_of_cores
+        allocated_cores, _ = db.allocate_numa_cores(
+            request.service_name,
+            request.numa_node,
+            request.num_of_cores,
+            request.preemption_policy,
+            eligible_cpus=pool.eligible_cpus,
+            check_online=provider.check_online,
         )
-        updated_stats = allocations_db.get_system_stats(isolated)
+        updated_stats = db.get_system_stats(eligible)
 
         return AllocateNumaCoresResponse(
             service_name=request.service_name,
             numa_node=request.numa_node,
             num_of_cores=request.num_of_cores,
             cores_allocated=allocated_cores,
+            preemption_policy=db.get_preemption_policy(request.service_name),
             total_available_cpus=stats["total_available_cpus"],
             remaining_available_cpus=updated_stats["remaining_available_cpus"],
         )
 
-    if not isolated:
-        raise ValueError("No Isolated CPUs available for allocation")
+    provider.validate_claims(db.get_claimed_cpus())
+    if not pool.eligible_cpus:
+        raise ValueError("No CPUs available")
 
     # Allocation path (num_of_cores > 0)
-    available_numa_cpus = get_cpus_in_numa_node(request.numa_node, isolated)
+    available_numa_cpus = get_cpus_in_numa_node(request.numa_node, eligible)
     if not available_numa_cpus:
-        raise ValueError(f"No isolated CPUs available in NUMA node {request.numa_node}")
+        raise ValueError(f"No eligible CPUs available in NUMA node {request.numa_node}")
 
     if len(available_numa_cpus) < request.num_of_cores:
         raise ValueError(
-            f"NUMA node {request.numa_node} only has {len(available_numa_cpus)} isolated CPUs, "
+            f"NUMA node {request.numa_node} only has {len(available_numa_cpus)} eligible CPUs, "
             f"but {request.num_of_cores} were requested"
         )
 
-    allocated_cores, _ = allocations_db.allocate_numa_cores(
-        request.service_name, request.numa_node, request.num_of_cores
+    allocated_cores, _ = db.allocate_numa_cores(
+        request.service_name,
+        request.numa_node,
+        request.num_of_cores,
+        request.preemption_policy,
+        eligible_cpus=pool.eligible_cpus,
+        check_online=provider.check_online,
     )
 
     if not allocated_cores:
@@ -229,13 +299,14 @@ def handle_allocate_numa_cores(
             f"All requested cores may be explicitly allocated to other services."
         )
 
-    updated_stats = allocations_db.get_system_stats(isolated)
+    updated_stats = db.get_system_stats(eligible)
 
     return AllocateNumaCoresResponse(
         service_name=request.service_name,
         numa_node=request.numa_node,
         num_of_cores=request.num_of_cores,
         cores_allocated=allocated_cores,
+        preemption_policy=db.get_preemption_policy(request.service_name),
         total_available_cpus=stats["total_available_cpus"],
         remaining_available_cpus=updated_stats["remaining_available_cpus"],
     )
@@ -325,50 +396,33 @@ def handle_allocate_hugepages(
         return ErrorResponse(error=f"Failed to record hugepage allocation: {e}")
 
 
-def handle_list_allocations(request: ListAllocationsRequest) -> ListAllocationsResponse:
-    """Handle list allocations action.
-
-    Returns:
-        ListAllocationsResponse with detailed allocation information
-    """
-    isolated = get_isolated_cpus()
-    if not isolated:
-        # Return empty response when no isolated CPUs are available
-        return ListAllocationsResponse(
-            total_allocations=0,
-            total_allocated_cpus=0,
-            total_available_cpus=0,
-            remaining_available_cpus=0,
-            allocations=[],
-        )
-
-    # Get system statistics
-    stats = allocations_db.get_system_stats(isolated)
-
-    # Build detailed allocation list
-    allocations = []
-    for service_name, allocated_cores in allocations_db._allocations.items():
-        cores_count = allocations_db.get_snap_allocation_count(service_name)
-        is_explicit = allocations_db.is_explicit_allocation(service_name)
-        allocations.append(
-            SnapAllocation(
-                service_name=service_name,
-                allocated_cores=allocated_cores,
-                cores_count=cores_count,
-                is_explicit=is_explicit,
-            )
-        )
-
+def handle_list_allocations(
+    request: ListAllocationsRequest,
+    pool_provider: Optional[CpuPoolProvider] = None,
+) -> ListAllocationsResponse:
+    """List every saved owner, including claims outside the current eligible pool."""
+    provider = pool_provider or get_cpu_pool_provider()
+    pool = provider.snapshot()
+    # Read ownership once so totals, policies and unavailable IDs remain coherent.
+    entries = allocations_db.get_all_allocations()
+    owned = set().union(*(parse_cpu_ranges(entry.allocated_cores) for entry in entries))
+    unavailable = owned - pool.eligible_cpus
     return ListAllocationsResponse(
-        total_allocations=stats["total_allocations"],
-        total_allocated_cpus=stats["total_allocated_cpus"],
-        total_available_cpus=stats["total_available_cpus"],
-        remaining_available_cpus=stats["remaining_available_cpus"],
-        allocations=allocations,
+        total_allocations=len(entries),
+        total_allocated_cpus=len(owned),
+        total_available_cpus=len(pool.eligible_cpus),
+        remaining_available_cpus=len(pool.eligible_cpus - owned),
+        allocations=entries,
+        cpu_pool=CpuPoolInfo(
+            source=pool.source,
+            configured_cpus=to_ranges(sorted(pool.configured_cpus)),
+            eligible_cpus=to_ranges(sorted(pool.eligible_cpus)),
+            unavailable_allocated_cpus=to_ranges(sorted(unavailable)),
+        ),
     )
 
 
-def handle_daemon_request(data: bytes) -> bytes:
+def handle_daemon_request(data: bytes, pool_provider: Optional[CpuPoolProvider] = None) -> bytes:
     """Handle daemon request."""
     response_bytes: bytes = b""
     try:
@@ -377,16 +431,22 @@ def handle_daemon_request(data: bytes) -> bytes:
         action_value = request_data.get("action")
 
         dispatcher: Dict[str, Tuple[Type[BaseModel], Callable[..., BaseModel]]] = {
-            ActionType.ALLOCATE_CORES.value: (AllocateCoresRequest, handle_allocate_cores),
+            ActionType.ALLOCATE_CORES.value: (
+                AllocateCoresRequest,
+                partial(handle_allocate_cores, pool_provider=pool_provider),
+            ),
             ActionType.ALLOCATE_CORES_PERCENT.value: (
                 AllocateCoresPercentRequest,
-                handle_allocate_cores_percent,
+                partial(handle_allocate_cores_percent, pool_provider=pool_provider),
             ),
             ActionType.ALLOCATE_NUMA_CORES.value: (
                 AllocateNumaCoresRequest,
-                handle_allocate_numa_cores,
+                partial(handle_allocate_numa_cores, pool_provider=pool_provider),
             ),
-            ActionType.LIST_ALLOCATIONS.value: (ListAllocationsRequest, handle_list_allocations),
+            ActionType.LIST_ALLOCATIONS.value: (
+                ListAllocationsRequest,
+                partial(handle_list_allocations, pool_provider=pool_provider),
+            ),
             ActionType.GET_MEMORY_INFO.value: (GetMemoryInfoRequest, handle_get_memory_info),
             ActionType.ALLOCATE_HUGEPAGES.value: (
                 AllocateHugepagesRequest,
@@ -420,10 +480,8 @@ def handle_daemon_request(data: bytes) -> bytes:
 
     logging.info("EPA response: %s", response_bytes.decode())
     try:
-        list_resp = handle_list_allocations(
-            ListAllocationsRequest(service_name="", action=ActionType.LIST_ALLOCATIONS)
-        )
-        logging.info("EPA allocations: %s", list_resp.json())
+        # Do not take a second pool snapshot just for diagnostic logging.
+        logging.info("EPA allocations: %s", allocations_db.get_all_allocations())
     except Exception as e:
         # Best-effort allocations logging; must not interfere with responding
         logging.warning("Failed to list EPA allocations for logging: %s", e)

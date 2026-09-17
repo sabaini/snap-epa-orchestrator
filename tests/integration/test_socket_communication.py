@@ -15,6 +15,7 @@ import pytest
 from pydantic import parse_obj_as
 
 from epa_orchestrator.allocations_db import allocations_db
+from epa_orchestrator.cpu_pool import CpuPoolProvider
 from epa_orchestrator.daemon_handler import handle_daemon_request
 from epa_orchestrator.schemas import (
     ActionType,
@@ -93,14 +94,42 @@ class TestSocketCommunication:
         if patch_ctx is not None:
             patch_ctx.__exit__(None, None, None)
 
+    def test_explicit_pool_all_apis_via_socket(
+        self, socket_daemon, socket_path, mock_cpu_files_empty
+    ):
+        """Count, percentage and NUMA succeed without isolation and persist real IDs."""
+        provider = CpuPoolProvider("2-5")
+        with (
+            patch("epa_orchestrator.daemon_handler.get_cpu_pool_provider", return_value=provider),
+            patch(
+                "epa_orchestrator.daemon_handler.get_numa_node_cpus",
+                return_value={0: set(range(8))},
+            ),
+            patch("epa_orchestrator.utils.get_numa_node_cpus", return_value={0: set(range(8))}),
+        ):
+            for action, params, field in (
+                ("allocate_cores", {"num_of_cores": 2}, "allocated_cores"),
+                ("allocate_cores_percent", {"percent": 50}, "allocated_cores"),
+                ("allocate_numa_cores", {"num_of_cores": 2, "numa_node": 0}, "cores_allocated"),
+            ):
+                payload = {"action": action, "service_name": "configured", **params}
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(socket_path)
+                    client.sendall(json.dumps(payload).encode())
+                    response = json.loads(client.recv(4096))
+                assert response[field] == "2-3"
+                assert response["total_available_cpus"] == 4
+                assert response["remaining_available_cpus"] == 2
+            assert allocations_db.get_allocation("configured") == "2-3"
+
     def patch_isolated_cpus_valid():
         """Patch get_isolated_cpus to return a valid CPU range string for tests."""
-        return patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7")
+        return patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-7")
 
     def patch_isolated_cpus_error():
         """Patch get_isolated_cpus to raise a RuntimeError for error scenario tests."""
         return patch(
-            "epa_orchestrator.daemon_handler.get_isolated_cpus",
+            "epa_orchestrator.cpu_pinning.get_isolated_cpus",
             side_effect=RuntimeError("No Isolated CPUs configured"),
         )
 
@@ -330,3 +359,43 @@ class TestSocketCommunication:
 
         resp = parse_obj_as(ErrorResponse, json.loads(resp_data.decode()))
         assert resp.error == "No Isolated CPUs configured"
+
+    @pytest.mark.parametrize("configured_mode", [False, True])
+    def test_nonpreemptive_round_trip(
+        self, socket_daemon, socket_path, monkeypatch, mock_cpu_files_empty, configured_mode
+    ):
+        """The socket protocol protects claims with either isolated or ordinary CPUs."""
+        if configured_mode:
+            provider = CpuPoolProvider("0-3")
+            monkeypatch.setattr(
+                "epa_orchestrator.daemon_handler.get_cpu_pool_provider", lambda: provider
+            )
+        else:
+            monkeypatch.setattr("epa_orchestrator.cpu_pinning.get_isolated_cpus", lambda: "0-3")
+        monkeypatch.setattr("epa_orchestrator.utils.get_numa_node_cpus", lambda: {0: {0, 1, 2, 3}})
+        monkeypatch.setattr(
+            "epa_orchestrator.daemon_handler.get_numa_node_cpus", lambda: {0: {0, 1, 2, 3}}
+        )
+
+        def request(action, service="a", **fields):
+            payload = {"version": "1.0", "action": action, "service_name": service, **fields}
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(socket_path)
+                client.sendall(json.dumps(payload).encode())
+                return json.loads(client.recv(65536))
+
+        assert (
+            "non-preemptive-allocations" in request("list_allocations")["supported_cpu_features"]
+        )
+        result = request("allocate_cores_percent", percent=100, preemption_policy="non-preemptive")
+        assert result["preemption_policy"] == "non-preemptive"
+        assert result["allocated_cores"] == "0-3"
+        before = request("list_allocations")
+        assert before["cpu_pool"]["source"] == ("configured" if configured_mode else "isolated")
+        assert "error" in request("allocate_numa_cores", "b", numa_node=0, num_of_cores=4)
+        assert request("list_allocations") == before
+        assert request("allocate_cores", num_of_cores=-1)["preemption_policy"] is None
+        assert (
+            request("allocate_numa_cores", "b", numa_node=0, num_of_cores=4)["preemption_policy"]
+            == "legacy"
+        )

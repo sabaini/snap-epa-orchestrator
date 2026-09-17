@@ -24,13 +24,13 @@ def get_isolated_cpus() -> str:
     try:
         with open(ISOLATED_CPUS_PATH, "r") as f:
             value = f.read().strip()
-            if value:
-                logging.info(f"Found isolated CPUs: {value}")
-                return value
+    except OSError as exc:
+        raise ValueError(f"Failed to read isolated CPUs from {ISOLATED_CPUS_PATH}: {exc}") from exc
+    if value:
+        logging.info(f"Found isolated CPUs: {value}")
+    else:
         logging.info("No Isolated CPUs configured")
-    except Exception as e:
-        logging.error(f"Failed to get CPU information: {e}")
-    return ""
+    return value
 
 
 def get_thread_siblings_map(cpus: set[int]) -> dict[int, set[int]]:

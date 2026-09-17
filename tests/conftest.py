@@ -3,7 +3,6 @@
 
 """Shared pytest fixtures for EPA Orchestrator tests."""
 
-import importlib
 import os
 import tempfile
 from pathlib import Path
@@ -12,6 +11,8 @@ from unittest.mock import patch
 import pytest
 
 import epa_orchestrator.allocations_db as allocations_db_mod
+import epa_orchestrator.cpu_pool as cpu_pool
+import epa_orchestrator.daemon_handler as daemon_handler
 import epa_orchestrator.hugepages_db as hugepages_db
 import epa_orchestrator.state_store as state_store
 
@@ -32,10 +33,9 @@ def setup_env_and_reload_modules(tmp_path_factory):
     """
     temp_base = tmp_path_factory.mktemp("epa-state")
     os.environ["SNAP_DATA"] = str(temp_base)
-    # Reload modules that depend on SNAP_DATA/state at import time
-    importlib.reload(state_store)
-    importlib.reload(hugepages_db)
-    importlib.reload(allocations_db_mod)
+    # Keep imported singleton references and exception identities intact.
+    hugepages_db._store = state_store.StateStore()
+    allocations_db_mod.allocations_db._state_store = state_store.StateStore()
 
 
 @pytest.fixture(autouse=True)
@@ -60,26 +60,42 @@ def reset_persistent_state():
         pass
 
 
+@pytest.fixture(autouse=True)
+def reset_cpu_provider(tmp_path, monkeypatch):
+    """Give legacy isolated-mode tests deterministic present/online topology."""
+    present = tmp_path / "present"
+    online = tmp_path / "online"
+    present.write_text("0-511")
+    online.write_text("0-511")
+    monkeypatch.setattr(cpu_pool.cpu_pinning, "PRESENT_CPUS_PATH", str(present))
+    monkeypatch.setattr(cpu_pool, "ONLINE_CPUS_PATH", str(online))
+    monkeypatch.setattr(daemon_handler, "_default_pool_provider", None)
+
+
 @pytest.fixture
 def mock_cpu_files(temp_dir):
     """Create mock CPU system files for testing."""
     isolated_path = temp_dir / "isolated"
     present_path = temp_dir / "present"
 
+    online_path = temp_dir / "online"
     # Create mock CPU files
     isolated_path.write_text("0-3,6-7")
     present_path.write_text("0-7")
+    online_path.write_text("0-7")
 
     with (
         patch("epa_orchestrator.cpu_pinning.ISOLATED_CPUS_PATH", str(isolated_path)),
         patch("epa_orchestrator.cpu_pinning.PRESENT_CPUS_PATH", str(present_path)),
     ):
-        yield {
-            "isolated": isolated_path,
-            "present": present_path,
-            "isolated_content": "0-3,6-7",
-            "present_content": "0-7",
-        }
+        with patch("epa_orchestrator.cpu_pool.ONLINE_CPUS_PATH", str(online_path)):
+            yield {
+                "online": online_path,
+                "isolated": isolated_path,
+                "present": present_path,
+                "isolated_content": "0-3,6-7",
+                "present_content": "0-7",
+            }
 
 
 @pytest.fixture
@@ -88,20 +104,24 @@ def mock_cpu_files_empty(temp_dir):
     isolated_path = temp_dir / "isolated"
     present_path = temp_dir / "present"
 
+    online_path = temp_dir / "online"
     # Create mock CPU files with empty isolated
     isolated_path.write_text("")
     present_path.write_text("0-7")
+    online_path.write_text("0-7")
 
     with (
         patch("epa_orchestrator.cpu_pinning.ISOLATED_CPUS_PATH", str(isolated_path)),
         patch("epa_orchestrator.cpu_pinning.PRESENT_CPUS_PATH", str(present_path)),
     ):
-        yield {
-            "isolated": isolated_path,
-            "present": present_path,
-            "isolated_content": "",
-            "present_content": "0-7",
-        }
+        with patch("epa_orchestrator.cpu_pool.ONLINE_CPUS_PATH", str(online_path)):
+            yield {
+                "online": online_path,
+                "isolated": isolated_path,
+                "present": present_path,
+                "isolated_content": "",
+                "present_content": "0-7",
+            }
 
 
 @pytest.fixture

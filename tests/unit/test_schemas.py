@@ -11,7 +11,10 @@ from epa_orchestrator.schemas import (
     AllocateCoresPercentRequest,
     AllocateCoresRequest,
     AllocateCoresResponse,
+    AllocateNumaCoresRequest,
+    CpuPoolInfo,
     ListAllocationsRequest,
+    ListAllocationsResponse,
     SnapAllocation,
 )
 
@@ -83,9 +86,55 @@ class TestSchemas:
         assert resp.service_name == "service1"
         assert resp.cores_allocated == 2
 
+    def test_pool_introspection_serialization(self):
+        """The additive pool object distinguishes configured, eligible and owned IDs."""
+        response = ListAllocationsResponse(
+            total_allocations=1,
+            total_allocated_cpus=1,
+            total_available_cpus=0,
+            remaining_available_cpus=0,
+            allocations=[SnapAllocation(service_name="owner", allocated_cores="2", cores_count=1)],
+            cpu_pool=CpuPoolInfo(
+                source="configured",
+                configured_cpus="2",
+                eligible_cpus="",
+                unavailable_allocated_cpus="2",
+            ),
+        )
+        assert response.model_dump()["cpu_pool"] == {
+            "source": "configured",
+            "configured_cpus": "2",
+            "eligible_cpus": "",
+            "unavailable_allocated_cpus": "2",
+        }
+        assert response.total_allocated_cpus > response.total_available_cpus
+
     def test_snap_allocation(self):
         """Test SnapAllocation model serialization."""
         alloc = SnapAllocation(service_name="service1", allocated_cores="0-1", cores_count=2)
         assert alloc.service_name == "service1"
         assert alloc.allocated_cores == "0-1"
         assert alloc.cores_count == 2
+
+
+@pytest.mark.parametrize(
+    "model,fields",
+    [
+        (AllocateCoresRequest, {"action": "allocate_cores", "num_of_cores": 1}),
+        (AllocateCoresPercentRequest, {"action": "allocate_cores_percent", "percent": 50}),
+        (
+            AllocateNumaCoresRequest,
+            {"action": "allocate_numa_cores", "numa_node": 0, "num_of_cores": 1},
+        ),
+    ],
+)
+def test_preemption_policy_schema(model, fields):
+    """Preserve omission for inheritance and reject unknown protection values."""
+    assert model(service_name="a", **fields).preemption_policy is None
+    for policy in ("legacy", "non-preemptive"):
+        assert (
+            model(service_name="a", preemption_policy=policy, **fields).preemption_policy == policy
+        )
+    for invalid in ("nonpreemptive", "", 1, []):
+        with pytest.raises(ValidationError):
+            model(service_name="a", preemption_policy=invalid, **fields)

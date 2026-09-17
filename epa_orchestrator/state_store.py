@@ -22,11 +22,17 @@ import os
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Callable, Dict, Generator, Optional, TypeVar
+
+T = TypeVar("T")
 
 
 class StateCorruptionError(Exception):
     """Raised when the persisted state file is detected as corrupt/invalid JSON."""
+
+
+class StateUncertainError(Exception):
+    """Mutations are blocked until observed state durability is recovered."""
 
 
 def _default_base_dir() -> str:
@@ -48,6 +54,8 @@ class StateStore:
         "hugepages_db": { ... }
     }
     """
+
+    _uncertain_paths: set[str] = set()
 
     def __init__(self, *, filename: str = "state.json", subdir: str = "data") -> None:
         """Initialize the store paths and ensure the base directory exists."""
@@ -88,7 +96,9 @@ class StateStore:
         try:
             with open(self._file_path, "r", encoding="utf-8") as f:
                 obj: object = json.load(f)
-                return obj if isinstance(obj, dict) else {}
+                if not isinstance(obj, dict):
+                    raise ValueError("State root must be an object")
+                return obj
         except Exception as e:
             # Treat invalid JSON as fatal corruption: raise to crash the daemon
             raise StateCorruptionError(
@@ -96,8 +106,11 @@ class StateStore:
             ) from e
 
     def _atomic_write_unlocked(self, data: Dict[str, Any]) -> None:
+        self._check_health_unlocked()
         temp_fd = None
         temp_path = None
+        replaced = False
+        marked = False
         try:
             # Write to a temp file in the same directory for atomic replace
             temp_fd, temp_path = tempfile.mkstemp(
@@ -108,15 +121,20 @@ class StateStore:
                 json.dump(data, tmp_fp, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
                 tmp_fp.flush()
                 os.fsync(tmp_fp.fileno())
+            self._set_uncertain_unlocked(True)
+            marked = True
             os.replace(temp_path, self._file_path)
-            # fsync directory to persist rename on crash
-            dir_fd = os.open(self._dir_path, os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            replaced = True
+            self._sync_directory()
+            self._set_uncertain_unlocked(False)
         except Exception as e:
             logging.error(f"Failed to atomically write state file {self._file_path}: {e}")
+            if replaced:
+                raise StateUncertainError(
+                    "State commit uncertain; recover storage before mutating"
+                ) from e
+            if marked:
+                self._set_uncertain_unlocked(False)
             raise
         finally:
             if temp_fd is not None:
@@ -130,6 +148,67 @@ class StateStore:
                 except OSError as e:
                     if e.errno != errno.ENOENT:
                         logging.debug(f"Cleanup temp file failed: {temp_path}: {e}")
+
+    def _sync_directory(self) -> None:
+        fd = os.open(self._dir_path, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _check_health_unlocked(self) -> None:
+        if self._lock_path in self._uncertain_paths:
+            raise StateUncertainError("State commit uncertain; explicit recovery required")
+        with open(self._lock_path, "rb") as lock:
+            if lock.read():
+                raise StateUncertainError("State commit uncertain; explicit recovery required")
+
+    def _set_uncertain_unlocked(self, uncertain: bool) -> None:
+        # The lock inode is never replaced: all processes observe the same latch.
+        self._uncertain_paths.add(self._lock_path)
+        try:
+            with open(self._lock_path, "r+b") as lock:
+                if uncertain:
+                    lock.write(b"uncertain\n")
+                else:
+                    lock.truncate(0)
+                lock.flush()
+                os.fsync(lock.fileno())
+            self._sync_directory()
+        except Exception:
+            # Keep a visible latch even when its durability cannot be confirmed.
+            with open(self._lock_path, "r+b", buffering=0) as lock:
+                lock.write(b"uncertain\n")
+            raise
+        if not uncertain:
+            self._uncertain_paths.discard(self._lock_path)
+
+    def recover(self) -> None:
+        """Durably retain observed state and unblock writes after operator reconciliation."""
+        with self._locked():
+            self._read_unlocked()
+            if os.path.exists(self._file_path):
+                with open(self._file_path, "rb") as state:
+                    os.fsync(state.fileno())
+            self._sync_directory()
+            self._set_uncertain_unlocked(False)
+
+    def transaction_section(
+        self, section: str, update: Callable[[Dict[str, Any]], tuple[Dict[str, Any], T]]
+    ) -> T:
+        """Read, validate and replace one section under the same exclusive lock."""
+        with self._locked():
+            self._check_health_unlocked()
+            state = self._read_unlocked()
+            content = state.get(section, {})
+            if not isinstance(content, dict):
+                raise StateCorruptionError(f"Invalid state section: {section}")
+            replacement, result = update(dict(content))
+            state[section] = replacement
+            state.setdefault("version", 1)
+            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._atomic_write_unlocked(state)
+            return result
 
     def read_all(self) -> Dict[str, Any]:
         """Read the entire state under an exclusive lock."""
@@ -148,14 +227,11 @@ class StateStore:
         """Read a single top-level section dictionary from the state file."""
         with self._locked():
             state = self._read_unlocked()
-            sec = state.get(section)
-            return dict(sec) if isinstance(sec, dict) else {}
+            sec = state.get(section, {})
+            if not isinstance(sec, dict):
+                raise StateCorruptionError(f"Invalid state section: {section}")
+            return dict(sec)
 
     def update_section(self, section: str, content: Dict[str, Any]) -> None:
         """Atomically update a single top-level section, preserving others."""
-        with self._locked():
-            state = self._read_unlocked()
-            state[section] = dict(content or {})
-            state.setdefault("version", 1)
-            state["updated_at"] = datetime.now(timezone.utc).isoformat()
-            self._atomic_write_unlocked(state)
+        self.transaction_section(section, lambda current: (dict(content), None))

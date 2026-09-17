@@ -107,7 +107,7 @@ class TestDaemonIntegration:
         with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value=""):
             response_bytes = handle_daemon_request(json.dumps(request).encode())
             resp = parse_obj_as(ErrorResponse, json.loads(response_bytes.decode()))
-            assert resp.error == "No Isolated CPUs available for allocation"
+            assert resp.error == "No CPUs available"
 
     @patch("epa_orchestrator.daemon_handler.get_memory_summary")
     def test_allocate_hugepages_track_positive(self, mock_summary):
@@ -305,7 +305,7 @@ class TestDaemonIntegration:
         """allocate_cores(num_of_cores=0) must use full pool when re-allocating."""
         allocations_db.clear_all_allocations()
         isolated = "96-127,224-255,352-383,480-511"  # 128 cores
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value=isolated):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value=isolated):
             # Simulate prior NUMA allocation: service already has 112 cores
             allocations_db.allocate_cores("openstack-hypervisor", "96-127,224-255,352-383,480-495")
             r = handle_allocate_cores(
@@ -322,7 +322,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_percent_fifty_percent(self):
         """Allocate 50% of isolated cores; 50% of 8 cores = 4 cores."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-7"):
             req = AllocateCoresPercentRequest(
                 service_name="service1",
                 action=ActionType.ALLOCATE_CORES_PERCENT,
@@ -334,7 +334,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_percent_deallocate(self):
         """percent=-1 deallocates the service's cores."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5"):
             r1 = handle_allocate_cores_percent(
                 AllocateCoresPercentRequest(
                     service_name="service1",
@@ -356,7 +356,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_percent_via_daemon_request(self):
         """allocate_cores_percent via handle_daemon_request JSON."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-9"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-9"):
             req = {
                 "version": "1.0",
                 "service_name": "service1",
@@ -371,7 +371,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_percent_ceil_rounding(self):
         """Computed core count uses ceil; 7 cores * 25% = 1.75 -> 2. Avoids num_of_cores=0 path."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-6"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-6"):
             r = handle_allocate_cores_percent(
                 AllocateCoresPercentRequest(
                     service_name="service1",
@@ -383,7 +383,7 @@ class TestDaemonIntegration:
 
     def test_allocate_cores_percent_small_percent_yields_one(self):
         """Validate that a small percentage of cores yields at least one core."""
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-7"):
             r = handle_allocate_cores_percent(
                 AllocateCoresPercentRequest(
                     service_name="service1",
@@ -396,7 +396,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_percent_zero_and_one(self):
         """percent=0 treated as 0 cores (deallocate); percent=1 with 100 cores gives 1."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-99"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-99"):
             req = handle_allocate_cores_percent(
                 AllocateCoresPercentRequest(
                     service_name="service1",
@@ -449,7 +449,7 @@ class TestDaemonIntegration:
 
     def test_allocate_cores_percent_no_isolated_cpus(self):
         """allocate_cores_percent returns error when no isolated CPUs."""
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value=""):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value=""):
             req = {
                 "version": "1.0",
                 "service_name": "service1",
@@ -463,7 +463,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_valid_override_and_second_service(self):
         """Allocate cores, then override; add second service within remaining."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5"):
             r1 = handle_allocate_cores(
                 AllocateCoresRequest(
                     service_name="svc-a-core", action=ActionType.ALLOCATE_CORES, num_of_cores=1
@@ -494,7 +494,7 @@ class TestDaemonIntegration:
     def test_allocate_cores_out_of_bound_and_invalid_param(self):
         """Out-of-bound request errors; numa_node param rejected for allocate_cores."""
         allocations_db.clear_all_allocations()
-        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5"):
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5"):
             _ = handle_allocate_cores(
                 AllocateCoresRequest(
                     service_name="svc-a-core", action=ActionType.ALLOCATE_CORES, num_of_cores=5
@@ -508,15 +508,12 @@ class TestDaemonIntegration:
                 )
             assert "Insufficient CPUs available" in str(ei.value)
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
-    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
     @patch(
         "epa_orchestrator.utils.get_numa_node_cpus",
         return_value={0: {0, 1, 2}, 1: {3, 4, 5}},
     )
-    def test_allocate_numa_valid_override_and_second_service(
-        self, mock_nodes, mock_iso_cp, mock_iso_dh
-    ):
+    def test_allocate_numa_valid_override_and_second_service(self, mock_nodes, mock_iso_cp):
         """Allocate in node, override count; second service consumes same node."""
         allocations_db.clear_all_allocations()
         r1 = handle_allocate_numa_cores(
@@ -553,7 +550,7 @@ class TestDaemonIntegration:
         )
         assert r3.cores_allocated != ""
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
     @patch(
         "epa_orchestrator.utils.get_numa_node_cpus",
         return_value={0: {0, 1, 2}, 1: {3, 4, 5}},
@@ -583,13 +580,12 @@ class TestDaemonIntegration:
             )
         assert "num_of_cores=0 is invalid" in str(ei2.value)
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
-    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
     @patch(
         "epa_orchestrator.daemon_handler.get_numa_node_cpus",
         return_value={1: {3, 4, 5}},
     )
-    def test_allocate_numa_nonexistent_node(self, mock_nodes, mock_iso_cp, mock_iso_dh):
+    def test_allocate_numa_nonexistent_node(self, mock_nodes, mock_iso_cp):
         """Requesting a NUMA node not present in topology raises error."""
         allocations_db.clear_all_allocations()
         with pytest.raises(ValueError) as ei:
@@ -603,7 +599,7 @@ class TestDaemonIntegration:
             )
         assert "NUMA node 0 does not exist" in str(ei.value)
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
     def test_allocate_numa_no_topology_error_response(self, mock_iso_dh):
         """When topology lookup raises, daemon request returns ErrorResponse with message."""
         req = {
@@ -621,13 +617,12 @@ class TestDaemonIntegration:
             resp = parse_obj_as(ErrorResponse, json.loads(resp_b.decode()))
             assert resp.error == "NUMA topology not available"
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
-    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
     @patch(
         "epa_orchestrator.utils.get_numa_node_cpus",
         return_value={0: {0, 1, 2}, 1: {3, 4, 5}},
     )
-    def test_allocate_numa_deallocate_path(self, mock_nodes, mock_iso_cp, mock_iso_dh):
+    def test_allocate_numa_deallocate_path(self, mock_nodes, mock_iso_cp):
         """Deallocate path clears service's allocation in the specified node."""
         allocations_db.clear_all_allocations()
         _ = handle_allocate_numa_cores(
@@ -672,10 +667,9 @@ class TestDaemonIntegration:
         assert allocations_db.get_allocation("svc-b-numa") == "0-1"
         assert not allocations_db.get_allocation("svc-a-numa")
 
-    @patch("epa_orchestrator.daemon_handler.calculate_cpu_pinning", return_value=("", ""))
+    @patch("epa_orchestrator.allocations_db.calculate_cpu_pinning", return_value=("", ""))
     @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-3")
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-3")
-    def test_allocate_cores_pinning_failure(self, mock_iso_dh, mock_iso_cp, mock_calc):
+    def test_allocate_cores_pinning_failure(self, mock_iso_cp, mock_calc):
         """If pinning yields no dedicated CPUs, handler raises ValueError."""
         allocations_db.clear_all_allocations()
         with pytest.raises(ValueError) as ei:
@@ -688,9 +682,8 @@ class TestDaemonIntegration:
             )
         assert "Failed to allocate 2 cores" in str(ei.value)
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-3")
     @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-3")
-    def test_allocate_cores_negative_request(self, mock_iso_cp, mock_iso_dh):
+    def test_allocate_cores_negative_request(self, mock_iso_cp):
         """Non-NUMA deallocation (-1) clears service allocation and frees CPUs for others.
 
         Flow:
@@ -743,7 +736,7 @@ class TestDaemonIntegration:
         assert r3.cores_allocated == 2
         assert allocations_db.get_snap_allocation_count("svc-b-core") == 2
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-3")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-3")
     def test_core_allocation_exclusive(self, mock_iso_cp):
         """Core allocation must be exclusive across services."""
         allocations_db.clear_all_allocations()
@@ -791,11 +784,8 @@ class TestDaemonIntegration:
         "epa_orchestrator.daemon_handler.get_numa_node_cpus",
         return_value={0: {0, 1, 2}, 1: {3, 4, 5}},
     )
-    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-5")
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
-    def test_numa_allocation_exclusive(
-        self, mock_iso_dh, mock_iso_db, mock_nodes_dh, mock_nodes_utils
-    ):
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-5")
+    def test_numa_allocation_exclusive(self, mock_iso_cp, mock_nodes_dh, mock_nodes_utils):
         """Numa allocation must be exclusive across services."""
         allocations_db.clear_all_allocations()
 
@@ -936,15 +926,14 @@ class TestDaemonIntegration:
         err4 = parse_obj_as(ErrorResponse, json.loads(resp4_b.decode()))
         assert "requested additional" in err4.error
 
-    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7")
-    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-7")
+    @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-7")
     @patch("epa_orchestrator.utils.get_numa_node_cpus", return_value={0: {0, 1, 2, 3, 4, 5, 6, 7}})
     @patch(
         "epa_orchestrator.daemon_handler.get_numa_node_cpus",
         return_value={0: {0, 1, 2, 3, 4, 5, 6, 7}},
     )
     def test_numa_smt_prefers_pairs_then_singles(
-        self, mock_nodes_dh, mock_nodes_utils, mock_iso_db, mock_iso_dh
+        self, mock_nodes_dh, mock_nodes_utils, mock_iso_cp
     ):
         """NUMA allocator should prefer full sibling pairs, then fill with singles (no blocking).
 
@@ -988,3 +977,125 @@ class TestDaemonIntegration:
             counts.append(c)
         assert counts.count(2) >= 2  # two full cores used
         assert counts.count(1) >= 1  # one single used
+
+
+@pytest.fixture
+def policy_api(monkeypatch):
+    """Provide a deterministic pool for daemon protocol regressions."""
+    monkeypatch.setattr("epa_orchestrator.cpu_pinning.get_isolated_cpus", lambda: "0-7")
+
+    def topology():
+        return {0: set(range(4)), 1: set(range(4, 8))}
+
+    monkeypatch.setattr("epa_orchestrator.utils.get_numa_node_cpus", topology)
+    monkeypatch.setattr("epa_orchestrator.daemon_handler.get_numa_node_cpus", topology)
+
+    def request(action, service="a", **fields):
+        return json.loads(
+            handle_daemon_request(
+                json.dumps(
+                    {"version": "1.0", "action": action, "service_name": service, **fields}
+                ).encode()
+            )
+        )
+
+    return request
+
+
+@pytest.mark.parametrize(
+    "action,fields",
+    [
+        ("allocate_cores", {"num_of_cores": 8}),
+        ("allocate_cores_percent", {"percent": 100}),
+        ("allocate_numa_cores", {"numa_node": 0, "num_of_cores": 4}),
+    ],
+)
+def test_policy_protocol_protection_and_confirmation(policy_api, action, fields):
+    """All CPU APIs confirm protection and prevent a legacy NUMA requester stealing it."""
+    assert "non-preemptive-allocations" in policy_api("list_allocations")["supported_cpu_features"]
+    result = policy_api(action, preemption_policy="non-preemptive", **fields)
+    assert "error" not in result
+    assert result["preemption_policy"] == "non-preemptive"
+    before = policy_api("list_allocations")
+    conflict = policy_api("allocate_numa_cores", "b", numa_node=0, num_of_cores=4)
+    assert "error" in conflict
+    assert policy_api("list_allocations") == before
+    assert before["allocations"][0]["preemption_policy"] == "non-preemptive"
+    assert policy_api("allocate_cores", num_of_cores=-1)["preemption_policy"] is None
+    assert "error" not in policy_api("allocate_numa_cores", "b", numa_node=0, num_of_cores=4)
+
+
+def test_omitted_policy_across_apis_and_release(policy_api):
+    """Wrappers retain inherited policy and node releases report remaining policy accurately."""
+    policy_api("allocate_cores", num_of_cores=2, preemption_policy="non-preemptive")
+    assert (
+        policy_api("allocate_cores_percent", percent=25)["preemption_policy"] == "non-preemptive"
+    )
+    assert (
+        policy_api("allocate_numa_cores", numa_node=1, num_of_cores=2)["preemption_policy"]
+        == "non-preemptive"
+    )
+    assert (
+        policy_api("allocate_numa_cores", numa_node=0, num_of_cores=-1)["preemption_policy"]
+        == "non-preemptive"
+    )
+    assert "error" in policy_api("allocate_cores", num_of_cores=2, preemption_policy="legacy")
+    assert policy_api("allocate_cores_percent", percent=0)["preemption_policy"] is None
+    assert policy_api("allocate_cores", num_of_cores=2)["preemption_policy"] == "legacy"
+
+
+def test_zero_capacity_lists_claims_and_support(policy_api, monkeypatch):
+    """Offline CPUs do not hide ownership, policy, or capability advertisement."""
+    policy_api("allocate_cores", num_of_cores=2, preemption_policy="non-preemptive")
+    # Online eligibility refreshes even though the configured choice is frozen.
+    monkeypatch.setattr("epa_orchestrator.cpu_pool.read_cpu_list", lambda path: frozenset())
+    result = policy_api("list_allocations")
+    assert result["supported_cpu_features"] == ["non-preemptive-allocations"]
+    assert result["total_available_cpus"] == 0
+    assert result["remaining_available_cpus"] == 0
+    assert result["allocations"][0]["allocated_cores"] == "0-1"
+    assert policy_api("allocate_cores", num_of_cores=-1)["preemption_policy"] is None
+    assert policy_api("list_allocations")["allocations"] == []
+
+
+def test_api_pre_replace_failure_returns_error(policy_api, monkeypatch):
+    """A storage failure cannot send a successful replacement or forget existing policy."""
+    policy_api("allocate_cores", num_of_cores=2, preemption_policy="non-preemptive")
+    before = policy_api("list_allocations")
+
+    def fail(*args):
+        raise OSError("simulated read-only state")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr("epa_orchestrator.state_store.os.replace", fail)
+        result = policy_api("allocate_cores", num_of_cores=4)
+    assert "error" in result
+    assert policy_api("list_allocations") == before
+
+
+def test_api_uncertain_commit_returns_error_and_blocks(policy_api, monkeypatch):
+    """No success reply is possible after replacement without directory durability."""
+    from epa_orchestrator.state_store import StateStore
+
+    policy_api("allocate_cores", num_of_cores=2, preemption_policy="non-preemptive")
+    sync = StateStore._sync_directory
+    calls = 0
+
+    def fail(self):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("uncertain commit")
+        sync(self)
+
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(StateStore, "_sync_directory", fail)
+            result = policy_api("allocate_cores", num_of_cores=4)
+        assert "error" in result
+        assert "error" in policy_api("allocate_cores", "b", num_of_cores=1)
+        claims = policy_api("list_allocations")["allocations"]
+        assert claims[0]["allocated_cores"] == "0-3"
+        assert claims[0]["preemption_policy"] == "non-preemptive"
+    finally:
+        allocations_db._state_store.recover()

@@ -5,6 +5,8 @@
 
 from unittest.mock import mock_open, patch
 
+import pytest
+
 from epa_orchestrator.cpu_pinning import calculate_cpu_pinning, get_isolated_cpus
 
 
@@ -105,6 +107,5 @@ class TestCpuPinning:
     def test_get_isolated_cpus_file_not_found(self, mock_logging):
         """Test behavior when isolated CPUs file doesn't exist."""
         with patch("builtins.open", side_effect=FileNotFoundError("File not found")):
-            result = get_isolated_cpus()
-            assert result == ""
-            mock_logging.error.assert_called_with("Failed to get CPU information: File not found")
+            with pytest.raises(ValueError, match="Failed to read isolated CPUs"):
+                get_isolated_cpus()
