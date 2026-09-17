@@ -25,7 +25,7 @@ See the [integration, release, downgrade, and recovery guide](docs/nonpreemptive
 Protection works with either the default isolated pool or an explicitly configured
 ordinary CPU pool. Selection, pool-conflict validation, ownership changes and the
 final online check share one state transaction; a persistence failure returns an
-error, never a successful grant. See [combined validation](docs/allocation-integration-validation.md).
+error, never a successful grant.
 
 ### CPU Allocation by Percentage
 
@@ -97,9 +97,17 @@ sudo snap restart epa-orchestrator.daemon
 
 The configured pool is fixed at daemon startup. Online status is refreshed per request:
 `eligible = configured ∩ online`, `free = eligible − claimed`. Offline configured CPUs
-remain in the configuration but cannot be granted. A final online check rejects a
-selected CPU that became unavailable with an error asking the client to retry, without
-changing allocations. CPUs can still go offline after a successful response.
+remain in the configuration but cannot be granted, and a CPU that leaves the machine's
+present topology behaves the same way: it stays configured and owned, never eligible.
+A final online check rejects a selected CPU that became unavailable with an error asking
+the client to retry, without changing allocations. CPUs can still go offline after a
+successful response.
+
+The configure hook rejects a **new** setting naming CPUs this machine does not have, so
+operator input is still validated against present topology. If pool discovery itself
+fails at startup (unreadable `cpu-pool` setting or CPU topology), the daemon logs the
+error and starts with zero capacity: `list_allocations` and releases keep working while
+new allocations are refused until the underlying problem is fixed.
 
 **Pool eligibility is accounting, not kernel isolation.** EPA does not activate scheduler
 isolation or IRQ isolation. CPU affinity, IRQ placement, kernel housekeeping and exclusion
@@ -292,6 +300,7 @@ Get all current service allocations:
 ```json
 {
   "version": "1.0",
+  "supported_cpu_features": ["non-preemptive-allocations"],
   "total_allocations": 2,
   "total_allocated_cpus": 4,
   "total_available_cpus": 20,
@@ -304,12 +313,14 @@ Get all current service allocations:
   },
   "allocations": [
     {
+      "preemption_policy": "legacy",
       "service_name": "my-service",
       "allocated_cores": "0-1",
       "cores_count": 2,
       "is_explicit": false
     },
     {
+      "preemption_policy": "non-preemptive",
       "service_name": "another-service",
       "allocated_cores": "2-3",
       "cores_count": 2,
@@ -324,6 +335,7 @@ Get all current service allocations:
 ```json
 {
   "version": "1.0",
+  "supported_cpu_features": ["non-preemptive-allocations"],
   "total_allocations": 0,
   "total_allocated_cpus": 0,
   "total_available_cpus": 0,
@@ -477,8 +489,7 @@ EPA_TEST_CPU_POOL=2-5 SOCKET_PATH=/var/snap/epa-orchestrator/current/data/epa.so
 ```
 
 These tests require successful grants and verify returned CPU IDs; they do not
-accept no-CPU errors. See [CPU pool validation](docs/cpu-pool-validation.md) for
-installed-snap evidence and remaining release dependencies.
+accept no-CPU errors.
 
 ## Contributing
 

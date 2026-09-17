@@ -3,9 +3,14 @@
 
 """Unit tests for epa_orchestrator.hugepages_db."""
 
+import concurrent.futures
+import threading
+
 import pytest
+from pydantic import ValidationError
 
 from epa_orchestrator import hugepages_db
+from epa_orchestrator.state_store import StateStore, StateUncertainError
 
 
 @pytest.fixture(autouse=True)
@@ -91,3 +96,143 @@ def test_remove_allocation_service_cleanup_when_empty():
     removed = hugepages_db.remove_allocation_for_key("svc-a", 0, 2048)
     assert removed is True
     assert hugepages_db.get_allocation("svc-a") is None
+
+
+@pytest.mark.parametrize("service", ["svc", "new"])
+def test_invalid_upsert_does_not_mutate_memory_or_disk(service):
+    """Validate a replacement before removing any prior record or adding an empty owner."""
+    hugepages_db.upsert_allocation("svc", 0, 2048, 10)
+    before = hugepages_db.list_allocations()
+    disk = hugepages_db._store.read_all()
+    with pytest.raises(ValidationError):
+        hugepages_db.upsert_allocation(service, 0, 2048, "invalid")
+    assert hugepages_db._allocations == before
+    assert hugepages_db._store.read_all() == disk
+
+
+@pytest.mark.parametrize("operation", ["upsert", "release", "clear"])
+@pytest.mark.parametrize("failure", ["replace", "fsync"])
+def test_hugepage_pre_replace_failure_preserves_state(monkeypatch, operation, failure):
+    """Every writer propagates a known storage failure without publishing the candidate."""
+    hugepages_db.upsert_allocation("svc", 0, 2048, 10)
+    before = hugepages_db.list_allocations()
+    disk = hugepages_db._store.read_all()
+
+    def fail(*args):
+        raise OSError("write failed")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(f"epa_orchestrator.state_store.os.{failure}", fail)
+        with pytest.raises(OSError, match="write failed"):
+            _mutate_hugepages(operation)
+    assert hugepages_db._allocations == before
+    assert hugepages_db._store.read_all() == disk
+    _mutate_hugepages(operation)
+    assert hugepages_db._allocations != before
+
+
+def _mutate_hugepages(operation):
+    if operation == "upsert":
+        hugepages_db.upsert_allocation("svc", 0, 2048, 20)
+    elif operation == "release":
+        hugepages_db.remove_allocation_for_key("svc", 0, 2048)
+    else:
+        hugepages_db.clear_all_allocations()
+
+
+@pytest.mark.parametrize("operation", ["upsert", "release", "clear"])
+def test_hugepage_uncertain_commit_reconciles_and_blocks(monkeypatch, operation):
+    """A failed post-replace sync exposes observed claims, blocks writers and recovers."""
+    hugepages_db.upsert_allocation("svc", 0, 2048, 10)
+    sync = StateStore._sync_directory
+    calls = 0
+
+    def fail(self):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("uncertain commit")
+        sync(self)
+
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(StateStore, "_sync_directory", fail)
+            with pytest.raises(StateUncertainError):
+                _mutate_hugepages(operation)
+        observed = hugepages_db._store.read_section("hugepages_db")["allocations"]
+        assert hugepages_db._allocations == observed
+        assert observed == (
+            {"svc": [{"node_id": 0, "size_kb": 2048, "count": 20}]}
+            if operation == "upsert"
+            else {}
+        )
+        for mutation in ("upsert", "release", "clear"):
+            with pytest.raises(StateUncertainError):
+                _mutate_hugepages(mutation)
+            assert hugepages_db._allocations == observed
+        hugepages_db._load_from_store()
+        assert hugepages_db.list_allocations() == observed
+    finally:
+        hugepages_db._store.recover()
+    hugepages_db.upsert_allocation("after-recovery", 0, 2048, 1)
+    assert hugepages_db.get_allocation("after-recovery")[0]["count"] == 1
+
+
+def test_hugepage_transactions_use_fresh_state_and_preserve_other_sections():
+    """A stale process cache must not overwrite other owners or unrelated state."""
+    store = StateStore()
+    hugepages_db.upsert_allocation("stale", 0, 2048, 10)
+    store.update_section("unrelated", {"keep": True})
+    store.update_section(
+        "hugepages_db",
+        {
+            "allocations": {"other": [{"node_id": 1, "size_kb": 2048, "count": 3}]},
+            "metadata": {"keep": True},
+        },
+    )
+    hugepages_db.upsert_allocation("new", 0, 2048, 1)
+    assert set(hugepages_db.list_allocations()) == {"other", "new"}
+    assert store.read_section("unrelated") == {"keep": True}
+    assert store.read_section("hugepages_db")["metadata"] == {"keep": True}
+    store.update_section("hugepages_db", {})
+    hugepages_db._load_from_store()
+    assert hugepages_db.list_allocations() == {}
+
+
+def test_hugepage_concurrent_writers_preserve_both_owners():
+    """Competing mutations must read and replace state under the same lock."""
+    barrier = threading.Barrier(2)
+
+    def allocate(index):
+        barrier.wait(timeout=5)
+        hugepages_db.upsert_allocation(f"owner-{index}", 0, 2048, index + 1)
+
+    with concurrent.futures.ThreadPoolExecutor(2) as executor:
+        list(executor.map(allocate, range(2)))
+    expected = {
+        f"owner-{index}": [{"node_id": 0, "size_kb": 2048, "count": index + 1}]
+        for index in range(2)
+    }
+    assert StateStore().read_section("hugepages_db")["allocations"] == expected
+    assert hugepages_db.list_allocations() == expected
+
+
+def test_legacy_hugepage_state_remains_readable():
+    """Legacy coercion/filtering stays compatible when a new owner is committed."""
+    StateStore().update_section(
+        "hugepages_db",
+        {
+            "allocations": {
+                "old-owner": [
+                    {"node_id": "0", "size_kb": "2048", "count": "2"},
+                    {"node_id": 1},
+                ],
+                "invalid": None,
+            },
+        },
+    )
+    hugepages_db.upsert_allocation("new-owner", 1, 2048, 1)
+    assert hugepages_db.list_allocations() == {
+        "old-owner": [{"node_id": 0, "size_kb": 2048, "count": 2}],
+        "new-owner": [{"node_id": 1, "size_kb": 2048, "count": 1}],
+    }

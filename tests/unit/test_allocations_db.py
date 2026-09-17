@@ -343,3 +343,16 @@ def test_internal_subtraction_inherits_requester_policy(numa_db):
     with pytest.raises(ValueError, match="Fully release"):
         numa_db._subtract_cpus_from_service("a", {0}, requester="b", requester_policy=LEGACY)
     assert numa_db._snapshot() == before
+
+
+@pytest.mark.parametrize("cores", [" ", ",", " , "])
+def test_cpu_less_allocation_never_persists_policy(numa_db, cores):
+    """A range string without CPUs must not write policy metadata that fails to load."""
+    before = numa_db._state_store.read_section("allocations_db")
+    numa_db.allocate_cores("ghost", cores, PROTECTED)
+    assert numa_db.get_allocation("ghost") is None
+    assert numa_db.get_preemption_policy("ghost") is None
+    assert numa_db._state_store.read_section("allocations_db") == before
+    assert "ghost" not in numa_db._snapshot()["preemption_policies"]
+    # The store stays loadable, so the daemon and configure hook still start.
+    assert AllocationsDB().get_all_allocations() == []

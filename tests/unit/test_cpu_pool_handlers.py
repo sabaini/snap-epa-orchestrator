@@ -9,7 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from epa_orchestrator.allocations_db import AllocationsDB, allocations_db
-from epa_orchestrator.cpu_pool import CpuPoolProvider
+from epa_orchestrator.cpu_pool import (
+    CpuPoolProvider,
+    load_startup_pool,
+    validate_snap_configuration,
+)
 from epa_orchestrator.daemon_handler import handle_daemon_request, validate_startup_pool
 from epa_orchestrator.utils import parse_cpu_ranges
 
@@ -202,3 +206,163 @@ def test_pending_configuration_does_not_change_active_pool(pool):
     with patch("epa_orchestrator.cpu_pool.subprocess.run", side_effect=AssertionError("snapctl")):
         assert request(pool, "list_allocations")["cpu_pool"]["configured_cpus"] == "2-5"
         assert request(pool, num_of_cores=1)["allocated_cores"] == "2"
+
+
+@pytest.mark.parametrize(
+    "action,params,field",
+    [
+        ("allocate_cores", {"num_of_cores": 3}, "allocated_cores"),
+        ("allocate_cores_percent", {"percent": 100}, "allocated_cores"),
+        ("allocate_numa_cores", {"num_of_cores": 3, "numa_node": 0}, "cores_allocated"),
+    ],
+)
+@pytest.mark.parametrize("missing_cpu", [0, 1])
+def test_mixed_sibling_read_failure_grants_exact_count(
+    mock_cpu_files_empty, tmp_path, monkeypatch, action, params, field, missing_cpu
+):
+    """Partial topology reads cannot spend the selection budget on duplicate CPU IDs."""
+    monkeypatch.setattr(
+        "epa_orchestrator.cpu_pinning.THREAD_SIBLINGS_LIST_TEMPLATE", str(tmp_path / "cpu{cpu}")
+    )
+    for cpu, siblings in {0: "0-1", 1: "0-1", 2: "2"}.items():
+        if cpu != missing_cpu:
+            (tmp_path / f"cpu{cpu}").write_text(siblings)
+    monkeypatch.setattr("epa_orchestrator.utils.get_numa_node_cpus", lambda: {0: {0, 1, 2}})
+    monkeypatch.setattr(
+        "epa_orchestrator.daemon_handler.get_numa_node_cpus", lambda: {0: {0, 1, 2}}
+    )
+    provider = CpuPoolProvider("0-2")
+    result = request(provider, action, preemption_policy="non-preemptive", **params)
+    assert "error" not in result, result
+    assert result[field] == "0-2"
+    assert result["remaining_available_cpus"] == 0
+    assert AllocationsDB().get_allocation("owner") == "0-2"
+
+
+@pytest.mark.parametrize(
+    "action,params",
+    [
+        ("allocate_cores", {"num_of_cores": 3}),
+        ("allocate_cores", {"num_of_cores": 0}),
+        ("allocate_cores_percent", {"percent": 75}),
+        ("allocate_numa_cores", {"num_of_cores": 3, "numa_node": 0}),
+    ],
+)
+@pytest.mark.parametrize("selected", [{2, 3}, {2, 3, 7}, {2, 3, 4, 5}])
+@pytest.mark.parametrize("original_policy", ["legacy", "non-preemptive"])
+def test_invalid_selection_preserves_claims_and_policy(
+    pool, monkeypatch, action, params, selected, original_policy
+):
+    """Short or out-of-pool selection must not commit a replacement or policy upgrade."""
+    request(pool, num_of_cores=1, preemption_policy=original_policy)
+    before = allocations_db._state_store.read_all()
+    monkeypatch.setattr(AllocationsDB, "_select_stable", lambda *args: selected)
+    result = request(pool, action, preemption_policy="non-preemptive", **params)
+    assert "error" in result, result
+    assert allocations_db._state_store.read_all() == before
+    assert AllocationsDB().get_preemption_policy("owner") == original_policy
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("numa", [False, True])
+def test_retained_protected_cpus_skip_topology_but_validate_and_commit(
+    pool, monkeypatch, count, numa
+):
+    """Retries and shrinks need no free-CPU topology but still check online and persist."""
+    request(pool, num_of_cores=2, preemption_policy="non-preemptive")
+    action = "allocate_numa_cores" if numa else "allocate_cores"
+    params = {"num_of_cores": count, **({"numa_node": 0} if numa else {})}
+    with (
+        patch("epa_orchestrator.allocations_db.get_thread_siblings_map") as topology,
+        patch.object(pool, "check_online", wraps=pool.check_online) as online,
+    ):
+        result = request(pool, action, **params)
+        assert "error" not in result, result
+        topology.assert_not_called()
+        online.assert_called_once_with(set(range(2, 2 + count)))
+    assert AllocationsDB().get_allocation("owner") == ("2" if count == 1 else "2-3")
+    before = allocations_db._state_store.read_all()
+    with patch.object(pool, "check_online", side_effect=ValueError("offline; retry")):
+        assert "offline" in request(pool, action, **params)["error"]
+    with patch("epa_orchestrator.state_store.os.replace", side_effect=OSError("write failed")):
+        assert "write failed" in request(pool, action, **params)["error"]
+    assert allocations_db._state_store.read_all() == before
+
+
+def test_short_legacy_numa_selection_preserves_all_owners(pool, monkeypatch):
+    """The shared NUMA boundary rejects a short result before legacy reclamation."""
+    request(pool, num_of_cores=1)
+    request(pool, service="other", num_of_cores=1)
+    before = allocations_db._state_store.read_all()
+    monkeypatch.setattr(AllocationsDB, "_select_numa_cpus_smt_aware", lambda *args: {2, 3})
+    result = request(pool, "allocate_numa_cores", num_of_cores=3, numa_node=0)
+    assert "exactly 3" in result["error"]
+    assert allocations_db._state_store.read_all() == before
+
+
+def test_short_ordinary_selection_preserves_claims(pool, monkeypatch):
+    """Validate even the initial ordinary selector against an explicit requested count."""
+    request(pool, num_of_cores=1)
+    before = allocations_db._state_store.read_all()
+    monkeypatch.setattr(
+        "epa_orchestrator.allocations_db.calculate_cpu_pinning", lambda *args: ("4-5", "2-3")
+    )
+    result = request(pool, num_of_cores=3)
+    assert "exactly 3" in result["error"]
+    assert allocations_db._state_store.read_all() == before
+
+
+def test_missing_present_cpus_keep_daemon_serving_and_recoverable(pool, mock_cpu_files_empty):
+    """A configured CPU leaving the machine must not cost listing, release or reconfiguration."""
+    assert request(pool, num_of_cores=2)["allocated_cores"] == "2-3"
+    # vCPU removal: the claimed CPUs are no longer present, so they are no longer online.
+    mock_cpu_files_empty["present"].write_text("0-1,6-7")
+    mock_cpu_files_empty["online"].write_text("0-1,6-7")
+    restarted = load_startup_pool_with("2-5")
+    listing = request(restarted, "list_allocations")
+    assert listing["cpu_pool"]["unavailable_allocated_cpus"] == "2-3"
+    assert listing["allocations"][0]["allocated_cores"] == "2-3"
+    assert "error" in request(restarted, num_of_cores=1)
+    assert "error" not in request(restarted, num_of_cores=-1)
+    # With the claims released, the operator can configure a pool of surviving CPUs.
+    with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="0-1"):
+        validate_snap_configuration()
+    assert request(load_startup_pool_with("0-1"), num_of_cores=1)["allocated_cores"] == "0"
+
+
+def load_startup_pool_with(configuration):
+    """Build the provider exactly as the daemon does at startup."""
+    with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value=configuration):
+        return load_startup_pool()
+
+
+def test_zero_capacity_startup_still_lists_and_releases(pool, caplog):
+    """Failed pool discovery blocks grants only, never introspection or release."""
+    assert request(pool, num_of_cores=2)["allocated_cores"] == "2-3"
+    with patch(
+        "epa_orchestrator.cpu_pool.read_snap_cpu_pool", side_effect=ValueError("snapctl failed")
+    ):
+        degraded = load_startup_pool()
+    validate_startup_pool(degraded)
+    assert "CPU pool discovery failed" in caplog.text
+    listing = request(degraded, "list_allocations")
+    assert listing["total_available_cpus"] == 0
+    assert listing["cpu_pool"] == {
+        "source": "isolated",
+        "configured_cpus": "",
+        "eligible_cpus": "",
+        "unavailable_allocated_cpus": "2-3",
+    }
+    assert "excludes allocated CPUs: 2-3" in request(degraded, num_of_cores=1)["error"]
+    assert "error" not in request(degraded, num_of_cores=-1)
+    assert allocations_db.get_allocation("owner") is None
+    assert request(degraded, num_of_cores=1)["error"] == "No CPUs available"
+
+
+def test_numa_ownership_error_names_the_blocking_claims(pool):
+    """The NUMA failure message must describe protected as well as explicit ownership."""
+    request(pool, service="protected", num_of_cores=2, preemption_policy="non-preemptive")
+    result = request(pool, "allocate_numa_cores", num_of_cores=4, numa_node=0)
+    assert "CPUs 2-3 are held by other services" in result["error"]
+    assert "non-preemptive" in result["error"]
+    assert allocations_db.get_allocation("owner") is None

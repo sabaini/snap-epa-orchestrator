@@ -324,3 +324,63 @@ class TestMemoryIntegration:
         assert response.version == "1.0"
         assert response.service_name == "test-service"
         assert isinstance(response.numa_hugepages, dict)
+
+
+@pytest.mark.parametrize(
+    "service,requested",
+    [("new-owner", 2), ("memory-owner", 2), ("memory-owner", -1), ("missing-owner", -1)],
+)
+def test_hugepage_api_honors_cpu_uncertainty_latch(monkeypatch, service, requested):
+    """CPU commit uncertainty rejects hugepage requests through reload and explicit recovery."""
+    from epa_orchestrator.allocations_db import allocations_db
+    from epa_orchestrator.state_store import StateStore, StateUncertainError
+
+    hugepages_db.upsert_allocation("memory-owner", 0, 2048, 10)
+    before = hugepages_db.list_allocations()
+    allocations_db.allocate_cores("cpu-owner", "0", "non-preemptive")
+    sync = StateStore._sync_directory
+    calls = 0
+
+    def fail(self):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("uncertain CPU commit")
+        sync(self)
+
+    payload = {
+        "action": "allocate_hugepages",
+        "service_name": service,
+        "node_id": 0,
+        "size_kb": 2048,
+        "hugepages_requested": requested,
+    }
+    monkeypatch.setattr(
+        "epa_orchestrator.daemon_handler.get_memory_summary", lambda: _mk_memory_summary(100)
+    )
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(StateStore, "_sync_directory", fail)
+            with pytest.raises(StateUncertainError):
+                allocations_db.allocate_cores("cpu-owner", "0-1")
+        for _ in range(2):
+            result = json.loads(handle_daemon_request(json.dumps(payload).encode()))
+            assert "uncertain" in result["error"]
+            assert "allocation_successful" not in result
+            assert hugepages_db._allocations == before
+            assert StateStore().read_section("hugepages_db")["allocations"] == before
+            # A fresh store and the on-disk marker alone must still reject mutations.
+            StateStore._uncertain_paths.discard(hugepages_db._store._lock_path)
+            monkeypatch.setattr(hugepages_db, "_store", StateStore())
+            hugepages_db._load_from_store()
+    finally:
+        allocations_db._state_store.recover()
+    result = json.loads(handle_daemon_request(json.dumps(payload).encode()))
+    assert result["allocation_successful"] is True
+    hugepages_db._load_from_store()
+    assert hugepages_db.get_allocation(service) == (
+        None if requested == -1 else [{"node_id": 0, "size_kb": 2048, "count": 2}]
+    )
+    if service != "memory-owner":
+        assert hugepages_db.get_allocation("memory-owner") == before["memory-owner"]
+    assert allocations_db.get_allocation("cpu-owner") == "0-1"

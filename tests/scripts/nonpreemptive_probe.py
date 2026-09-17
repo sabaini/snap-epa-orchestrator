@@ -6,6 +6,7 @@
 
 import argparse
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -174,11 +175,15 @@ class Probe:
         before_bytes = self.args.state.read_bytes()
         self.command(["chattr", "+i", str(self.args.state)])
         try:
-            for owner in OWNERS:
+            for owner, count in ((OWNERS[0], 2), (OWNERS[1], 1)):
                 result = self.request(
-                    "allocate_cores", owner, num_of_cores=2, preemption_policy=POLICY
+                    "allocate_cores", owner, num_of_cores=count, preemption_policy=POLICY
                 )
-                assert "error" in result, result
+                error = result.get("error", "")
+                assert f"[Errno {errno.EPERM}]" in error, result
+                assert any(
+                    str(path) in error for path in (self.args.state, self.args.state.resolve())
+                ), result
                 assert self.args.state.read_bytes() == before_bytes
                 assert self.allocations() == before
             self.report["immutable_state"] = json.loads(before_bytes)

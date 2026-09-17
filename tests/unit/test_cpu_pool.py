@@ -10,7 +10,9 @@ from unittest.mock import patch
 import pytest
 
 from epa_orchestrator.cpu_pool import (
+    MAX_CPU_ID,
     CpuPoolProvider,
+    load_startup_pool,
     parse_cpu_list,
     read_snap_cpu_pool,
     validate_snap_configuration,
@@ -77,12 +79,63 @@ def test_offline_and_online_refresh(mock_cpu_files_empty):
     assert provider.snapshot().eligible_cpus == {2, 3, 4, 5}
 
 
-@pytest.mark.parametrize("filename", ["present", "isolated", "online"])
+@pytest.mark.parametrize("filename", ["isolated", "online"])
 def test_required_sysfs_read_failure(filename, mock_cpu_files):
     """A missing required topology file is an error, unlike empty isolation."""
     mock_cpu_files[filename].unlink()
     with pytest.raises(ValueError, match="Failed to read"):
         CpuPoolProvider().snapshot()
+
+
+def test_absent_configured_cpus_are_retained_not_fatal(mock_cpu_files_empty):
+    """A CPU that leaves the machine behaves exactly like an offline CPU."""
+    mock_cpu_files_empty["present"].write_text("0-3")
+    mock_cpu_files_empty["online"].write_text("0-3")
+    provider = CpuPoolProvider("2-5")
+    snapshot = provider.snapshot()
+    assert snapshot.configured_cpus == {2, 3, 4, 5}
+    assert snapshot.eligible_cpus == {2, 3}
+    # Unreadable present topology must not stop a configured pool from loading either.
+    mock_cpu_files_empty["present"].unlink()
+    assert CpuPoolProvider("2-5").snapshot().eligible_cpus == {2, 3}
+
+
+@pytest.mark.parametrize("value", [f"0-{MAX_CPU_ID + 1}", str(MAX_CPU_ID + 1)])
+def test_unbounded_input_rejected_without_present_topology(value):
+    """Dropping the membership check must not allow unbounded range expansion."""
+    with pytest.raises(ValueError, match=f"exceeds {MAX_CPU_ID}"):
+        parse_cpu_list(value)
+
+
+@pytest.mark.parametrize(
+    "failure,expected_source",
+    [("snapctl", "isolated"), ("isolated", "isolated"), ("configured", "configured")],
+)
+def test_startup_pool_degrades_to_zero_capacity(mock_cpu_files, caplog, failure, expected_source):
+    """Failed discovery keeps the daemon serving instead of aborting startup."""
+    if failure == "snapctl":
+        context = patch(
+            "epa_orchestrator.cpu_pool.read_snap_cpu_pool", side_effect=ValueError("snapctl")
+        )
+    else:
+        mock_cpu_files["isolated"].unlink()
+        value = None if failure == "isolated" else "nonsense"
+        context = patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value=value)
+    with context:
+        provider = load_startup_pool()
+    snapshot = provider.snapshot()
+    assert snapshot.source == expected_source
+    assert snapshot.configured_cpus == snapshot.eligible_cpus == frozenset()
+    assert "CPU pool discovery failed" in caplog.text
+    provider.validate_claims(set())
+    with pytest.raises(ValueError, match="excludes allocated CPUs"):
+        provider.validate_claims({1})
+
+
+def test_startup_pool_uses_configuration_when_readable(mock_cpu_files_empty):
+    """The degradation path must not mask a usable configured pool."""
+    with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-4"):
+        assert load_startup_pool().snapshot().eligible_cpus == {2, 3, 4}
 
 
 def test_configured_mode_does_not_read_isolated(mock_cpu_files):
@@ -144,3 +197,13 @@ def test_hook_claim_validation(mock_cpu_files_empty, fresh_allocations_db):
             with pytest.raises(ValueError):
                 validate_snap_configuration()
     assert fresh_allocations_db._state_store.read_all() == before
+
+
+def test_hook_still_rejects_absent_cpus(mock_cpu_files_empty, fresh_allocations_db):
+    """Operator input naming missing CPUs stays an error even though startup tolerates it."""
+    mock_cpu_files_empty["present"].write_text("0-3")
+    with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-5"):
+        with pytest.raises(ValueError, match="present CPU topology"):
+            validate_snap_configuration()
+    with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-3"):
+        validate_snap_configuration()

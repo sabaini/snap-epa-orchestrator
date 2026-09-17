@@ -153,8 +153,7 @@ sudo python3 tests/scripts/nonpreemptive_probe.py \
 `--socket`, `--state`, `--snap-name`, and `--numa-node` are configurable. Evidence
 includes API transcript, source identifier and installed Python hashes, snap
 metadata, kernel setup, protected and final state, affinity observations, and
-journal output. For uncommitted builds also retain the source diff/archive hash:
-a baseline SHA alone does not identify the candidate.
+journal output.
 
 Checks cover count, percentage and NUMA protection before/after restart, legacy NUMA
 conflicts without ownership/affinity changes, coordinated release and reuse, a
@@ -163,5 +162,4 @@ and replacement of an existing protected claim. Unit tests additionally inject
 post-replacement fsync failures, recovery failures, and concurrent DB requests.
 The probe discovers the active eligible pool through `list_allocations.cpu_pool`,
 so it also works without isolated CPUs after configuring `cpu-pool` and restarting
-the daemon. See [combined validation](allocation-integration-validation.md) for the
-integration worktree's test results.
+the daemon.

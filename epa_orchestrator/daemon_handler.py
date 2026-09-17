@@ -106,12 +106,11 @@ def validate_startup_pool(provider: CpuPoolProvider) -> None:
 def handle_allocate_cores(
     request: AllocateCoresRequest,
     pool_provider: Optional[CpuPoolProvider] = None,
-    snapshot: Optional[CpuPoolSnapshot] = None,
 ) -> AllocateCoresResponse:
     """Allocate using one pool snapshot and one locked ownership transaction."""
     provider = pool_provider or get_cpu_pool_provider()
     return allocations_db.transaction(
-        lambda db: _allocate_cores(request, db, provider, snapshot or provider.snapshot())
+        lambda db: _allocate_cores(request, db, provider, provider.snapshot())
     )
 
 
@@ -284,7 +283,7 @@ def _allocate_numa_cores(
             f"but {request.num_of_cores} were requested"
         )
 
-    allocated_cores, _ = db.allocate_numa_cores(
+    allocated_cores, unavailable = db.allocate_numa_cores(
         request.service_name,
         request.numa_node,
         request.num_of_cores,
@@ -295,8 +294,9 @@ def _allocate_numa_cores(
 
     if not allocated_cores:
         raise ValueError(
-            f"Failed to allocate cores from NUMA node {request.numa_node}. "
-            f"All requested cores may be explicitly allocated to other services."
+            f"Failed to allocate {request.num_of_cores} cores from NUMA node "
+            f"{request.numa_node}. CPUs {unavailable} are held by other services through "
+            f"an explicit NUMA or non-preemptive claim."
         )
 
     updated_stats = db.get_system_stats(eligible)

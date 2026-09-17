@@ -272,6 +272,9 @@ class AllocationsDB:
             return
         policy = self._effective_policy(service_name, preemption_policy)
         new_cpu_set = self._parse_cpu_ranges(allocated_cores)
+        if not new_cpu_set:
+            # Never record policy metadata without claims: that state cannot be loaded.
+            return
         others = self._allocated_cpus - self._get_service_allocation_set(service_name)
         if new_cpu_set & others:
             raise ValueError("Requested CPUs are already allocated to other services")
@@ -300,13 +303,14 @@ class AllocationsDB:
         shared, dedicated = calculate_cpu_pinning(to_ranges(sorted(candidates)), count)
         if not dedicated:
             raise ValueError(f"Failed to allocate {count} cores")
+        selected = self._parse_cpu_ranges(dedicated)
+        target_count = count if count > 0 else len(selected)
         if policy == PreemptionPolicy.NON_PREEMPTIVE:
-            selected = self._select_stable(
-                service_name, candidates, len(self._parse_cpu_ranges(dedicated))
-            )
+            selected = self._select_stable(service_name, candidates, target_count)
             dedicated = to_ranges(sorted(selected))
             shared = to_ranges(sorted(candidates - selected))
-        check_online(self._parse_cpu_ranges(dedicated))
+        self._validate_selection(selected, candidates, target_count)
+        check_online(selected)
         self.allocate_cores(service_name, dedicated, policy)
         return shared, dedicated
 
@@ -319,7 +323,14 @@ class AllocationsDB:
     def _select_stable(self, service_name: str, candidates: set[int], count: int) -> set[int]:
         own = self._get_service_allocation_set(service_name) & candidates
         retained = set(sorted(own)[:count])
+        if len(retained) == count:
+            return retained
         return retained | self._select_numa_cpus_smt_aware(candidates - own, count - len(retained))
+
+    def _validate_selection(self, selected: set[int], candidates: set[int], count: int) -> None:
+        """Reject a short or invalid selector result before changing ownership."""
+        if len(selected) != count or not selected <= candidates:
+            raise ValueError(f"Failed to select exactly {count} eligible CPUs")
 
     def _validate_reclamation(
         self, owner: str, cpus: set[int], requester_policy: PreemptionPolicy
@@ -439,6 +450,7 @@ class AllocationsDB:
             if policy == PreemptionPolicy.NON_PREEMPTIVE
             else self._select_numa_cpus_smt_aware(candidates, num_of_cores)
         )
+        self._validate_selection(selected, candidates, num_of_cores)
         self._apply_numa_explicit_allocation(
             service_name,
             numa_node,
@@ -464,17 +476,17 @@ class AllocationsDB:
         if not candidate_cpus:
             return []
         mapping = get_thread_siblings_map(set(candidate_cpus))
-        group_to_members: dict[tuple[int, ...], list[int]] = {}
+        ungrouped = set(candidate_cpus)
+        groups: list[list[int]] = []
         for cpu in sorted(candidate_cpus):
-            group_tuple = tuple(sorted(mapping.get(cpu, {cpu})))
-            if group_tuple not in group_to_members:
-                members = [m for m in group_tuple if m in candidate_cpus]
-                group_to_members[group_tuple] = sorted(members)
-        ordered_groups = [
-            group_to_members[k]
-            for k in sorted(group_to_members.keys(), key=lambda g: g[0] if g else -1)
-        ]
-        return ordered_groups
+            if cpu not in ungrouped:
+                continue
+            # A partial sysfs read can disagree with a sibling's singleton fallback.
+            # Assign each candidate exactly once, regardless of that disagreement.
+            members = (mapping.get(cpu, {cpu}) | {cpu}) & ungrouped
+            groups.append(sorted(members))
+            ungrouped -= members
+        return groups
 
     def _select_from_groups_pairs_then_singles(
         self, groups: list[list[int]], count: int
@@ -549,18 +561,6 @@ class AllocationsDB:
         self._load_from_store()
         return self._allocations.get(service_name)
 
-    def is_explicit_allocation(self, service_name: str) -> bool:
-        """Check if a service has an explicit allocation.
-
-        Args:
-            service_name: Name of the service
-
-        Returns:
-            True if the service has an explicit allocation, False otherwise
-        """
-        self._load_from_store()
-        return service_name in self._explicit_allocations
-
     def get_all_allocations(self) -> list[SnapAllocation]:
         """Get all service allocations.
 
@@ -611,15 +611,6 @@ class AllocationsDB:
         """Return all recorded claims, without reloading inside a transaction."""
         self._load_from_store()
         return set(self._allocated_cpus)
-
-    def get_total_allocated_count(self) -> int:
-        """Get the total number of allocated CPUs.
-
-        Returns:
-            Number of allocated CPUs
-        """
-        self._load_from_store()
-        return len(self._allocated_cpus)
 
     def get_snap_allocation_count(self, service_name: str) -> int:
         """Get the number of CPUs allocated to a specific service.

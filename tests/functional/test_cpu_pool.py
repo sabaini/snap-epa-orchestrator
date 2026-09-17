@@ -69,7 +69,12 @@ def test_configured_pool_success(socket_path, configured_pool, action, params, f
     result = _request(socket_path, action, **params)
     assert "error" not in result, result
     selected = _ids(result[field])
-    assert len(selected) == 1
+    expected_count = (
+        (len(configured_pool) * params["percent"] + 99) // 100
+        if action == "allocate_cores_percent"
+        else params["num_of_cores"]
+    )
+    assert len(selected) == expected_count
     assert selected <= configured_pool
     assert result["total_available_cpus"] == len(configured_pool)
     listing = _request(socket_path, "list_allocations")
