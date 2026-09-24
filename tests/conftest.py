@@ -3,7 +3,9 @@
 
 """Shared pytest fixtures for EPA Orchestrator tests."""
 
+import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +17,24 @@ import epa_orchestrator.cpu_pool as cpu_pool
 import epa_orchestrator.daemon_handler as daemon_handler
 import epa_orchestrator.hugepages_db as hugepages_db
 import epa_orchestrator.state_store as state_store
+
+
+@pytest.fixture
+def snap_pool_options(monkeypatch):
+    """Model snapctl option reads/writes within a successful configure transaction."""
+    options = {}
+
+    def run(argv, **kwargs):
+        if argv[:3] == ["snapctl", "get", "-d"]:
+            key = argv[3]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({key: options.get(key)}))
+        assert argv[:2] == ["snapctl", "set"]
+        key, value = argv[2].split("=", 1)
+        options[key] = json.loads(value)
+        return subprocess.CompletedProcess(argv, 0, "")
+
+    monkeypatch.setattr(cpu_pool.subprocess, "run", run)
+    return options
 
 
 @pytest.fixture

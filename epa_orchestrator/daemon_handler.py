@@ -110,7 +110,9 @@ def handle_allocate_cores(
     """Allocate using one pool snapshot and one locked ownership transaction."""
     provider = pool_provider or get_cpu_pool_provider()
     return allocations_db.transaction(
-        lambda db: _allocate_cores(request, db, provider, provider.snapshot())
+        lambda db: _allocate_cores(
+            request, db, provider, provider.snapshot(allow_unavailable=request.num_of_cores == -1)
+        )
     )
 
 
@@ -180,7 +182,9 @@ def handle_allocate_cores_percent(
     """
     provider = pool_provider or get_cpu_pool_provider()
     return allocations_db.transaction(
-        lambda db: _allocate_cores_percent(request, db, provider, provider.snapshot())
+        lambda db: _allocate_cores_percent(
+            request, db, provider, provider.snapshot(allow_unavailable=request.percent in (-1, 0))
+        )
     )
 
 
@@ -225,7 +229,9 @@ def handle_allocate_numa_cores(
     """
     provider = pool_provider or get_cpu_pool_provider()
     return allocations_db.transaction(
-        lambda db: _allocate_numa_cores(request, db, provider, provider.snapshot())
+        lambda db: _allocate_numa_cores(
+            request, db, provider, provider.snapshot(allow_unavailable=request.num_of_cores == -1)
+        )
     )
 
 
@@ -402,7 +408,7 @@ def handle_list_allocations(
 ) -> ListAllocationsResponse:
     """List every saved owner, including claims outside the current eligible pool."""
     provider = pool_provider or get_cpu_pool_provider()
-    pool = provider.snapshot()
+    pool = provider.snapshot(allow_unavailable=True)
     # Read ownership once so totals, policies and unavailable IDs remain coherent.
     entries = allocations_db.get_all_allocations()
     owned = set().union(*(parse_cpu_ranges(entry.allocated_cores) for entry in entries))

@@ -104,10 +104,20 @@ the client to retry, without changing allocations. CPUs can still go offline aft
 successful response.
 
 The configure hook rejects a **new** setting naming CPUs this machine does not have, so
-operator input is still validated against present topology. If pool discovery itself
-fails at startup (unreadable `cpu-pool` setting or CPU topology), the daemon logs the
+operator input is still validated against present topology. Once accepted, an unchanged
+pool (including equivalent CPU-list formatting) remains valid during refresh even if
+CPUs disappear. The hook maintains `internal.validated-cpu-pool` in the same snap
+configuration transaction; this is internal bookkeeping, not an operator setting.
+
+If pool discovery fails at startup (unreadable `cpu-pool` setting or CPU topology), the daemon logs the
 error and starts with zero capacity: `list_allocations` and releases keep working while
 new allocations are refused until the underlying problem is fixed.
+
+If online topology cannot be read, listing still shows all saved claims and releases
+remain available. Capacity and eligible CPUs are conservatively reported as zero/empty,
+all saved claims are shown as unavailable, and the daemon logs the discovery error.
+New allocations fail until topology can be read again. Per-node release still requires
+NUMA topology; use full-service release if node membership is also unavailable.
 
 **Pool eligibility is accounting, not kernel isolation.** EPA does not activate scheduler
 isolation or IRQ isolation. CPU affinity, IRQ placement, kernel housekeeping and exclusion

@@ -11,6 +11,7 @@ import pytest
 
 from epa_orchestrator.cpu_pool import (
     MAX_CPU_ID,
+    VALIDATED_POOL_OPTION,
     CpuPoolProvider,
     load_startup_pool,
     parse_cpu_list,
@@ -184,7 +185,7 @@ def test_snap_read_failure_is_not_default(failure):
             read_snap_cpu_pool()
 
 
-def test_hook_claim_validation(mock_cpu_files_empty, fresh_allocations_db):
+def test_hook_claim_validation(mock_cpu_files_empty, fresh_allocations_db, snap_pool_options):
     """A hook allows supersets/offline owners but rejects shrinking and empty input."""
     fresh_allocations_db.allocate_cores("owner", "2-3")
     before = fresh_allocations_db._state_store.read_all()
@@ -197,9 +198,12 @@ def test_hook_claim_validation(mock_cpu_files_empty, fresh_allocations_db):
             with pytest.raises(ValueError):
                 validate_snap_configuration()
     assert fresh_allocations_db._state_store.read_all() == before
+    assert snap_pool_options[VALIDATED_POOL_OPTION] == "2-3"
 
 
-def test_hook_still_rejects_absent_cpus(mock_cpu_files_empty, fresh_allocations_db):
+def test_hook_still_rejects_absent_cpus(
+    mock_cpu_files_empty, fresh_allocations_db, snap_pool_options
+):
     """Operator input naming missing CPUs stays an error even though startup tolerates it."""
     mock_cpu_files_empty["present"].write_text("0-3")
     with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-5"):
@@ -207,3 +211,61 @@ def test_hook_still_rejects_absent_cpus(mock_cpu_files_empty, fresh_allocations_
             validate_snap_configuration()
     with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-3"):
         validate_snap_configuration()
+
+
+@pytest.mark.parametrize("present_failure", ["absent", "unreadable"])
+def test_hook_unchanged_pool_survives_topology_loss(
+    mock_cpu_files_empty, fresh_allocations_db, snap_pool_options, present_failure
+):
+    """Refresh accepts a saved pool with unavailable owners; new input stays strict."""
+    snap_pool_options["cpu-pool"] = "2-5"
+    fresh_allocations_db.allocate_cores("owner", "4-5")
+    validate_snap_configuration()
+    before = fresh_allocations_db._state_store.read_all()
+    if present_failure == "absent":
+        mock_cpu_files_empty["present"].write_text("0-3")
+    else:
+        mock_cpu_files_empty["present"].unlink()
+    mock_cpu_files_empty["online"].write_text("0-3")
+    # Refresh and semantically identical input must not need present topology.
+    for value in ("2-5", "5, 2-4, 3"):
+        snap_pool_options["cpu-pool"] = value
+        validate_snap_configuration()
+    assert fresh_allocations_db._state_store.read_all() == before
+    assert snap_pool_options[VALIDATED_POOL_OPTION] == "2-5"
+    snap_pool_options["cpu-pool"] = "2-6"
+    with pytest.raises(ValueError):
+        validate_snap_configuration()
+    assert snap_pool_options[VALIDATED_POOL_OPTION] == "2-5"
+
+
+def test_hook_unset_forgets_previously_accepted_explicit_pool(
+    mock_cpu_files_empty, snap_pool_options
+):
+    """Returning to isolation must not let an old explicit pool bypass validation."""
+    snap_pool_options["cpu-pool"] = "2-5"
+    validate_snap_configuration()
+    snap_pool_options.pop("cpu-pool")
+    validate_snap_configuration()
+    assert snap_pool_options[VALIDATED_POOL_OPTION] == "isolated"
+    mock_cpu_files_empty["present"].write_text("0-3")
+    snap_pool_options["cpu-pool"] = "2-5"
+    with pytest.raises(ValueError, match="present CPU topology"):
+        validate_snap_configuration()
+    assert snap_pool_options[VALIDATED_POOL_OPTION] == "isolated"
+
+
+def test_hook_validation_record_write_failure(mock_cpu_files_empty, snap_pool_options):
+    """A failed validation-record write fails the hook instead of accepting the change."""
+    snap_pool_options["cpu-pool"] = "2-5"
+    run = subprocess.run
+
+    def fail_set(argv, **kwargs):
+        if argv[:2] == ["snapctl", "set"]:
+            raise subprocess.CalledProcessError(1, argv)
+        return run(argv, **kwargs)
+
+    with patch("epa_orchestrator.cpu_pool.subprocess.run", side_effect=fail_set):
+        with pytest.raises(ValueError, match="Failed to record validated"):
+            validate_snap_configuration()
+    assert VALIDATED_POOL_OPTION not in snap_pool_options

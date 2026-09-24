@@ -312,7 +312,9 @@ def test_short_ordinary_selection_preserves_claims(pool, monkeypatch):
     assert allocations_db._state_store.read_all() == before
 
 
-def test_missing_present_cpus_keep_daemon_serving_and_recoverable(pool, mock_cpu_files_empty):
+def test_missing_present_cpus_keep_daemon_serving_and_recoverable(
+    pool, mock_cpu_files_empty, snap_pool_options
+):
     """A configured CPU leaving the machine must not cost listing, release or reconfiguration."""
     assert request(pool, num_of_cores=2)["allocated_cores"] == "2-3"
     # vCPU removal: the claimed CPUs are no longer present, so they are no longer online.
@@ -366,3 +368,56 @@ def test_numa_ownership_error_names_the_blocking_claims(pool):
     assert "CPUs 2-3 are held by other services" in result["error"]
     assert "non-preemptive" in result["error"]
     assert allocations_db.get_allocation("owner") is None
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed"])
+@pytest.mark.parametrize(
+    "action,params",
+    [
+        ("allocate_cores", {"num_of_cores": -1}),
+        ("allocate_cores_percent", {"percent": 0}),
+        ("allocate_cores_percent", {"percent": -1}),
+        ("allocate_numa_cores", {"num_of_cores": -1, "numa_node": 0}),
+    ],
+)
+def test_unreadable_online_keeps_listing_and_release_available(
+    pool, mock_cpu_files_empty, caplog, failure, action, params
+):
+    """Topology failures block grants but never hide or prevent releasing saved claims."""
+    assert (
+        request(pool, num_of_cores=2, preemption_policy="non-preemptive")["allocated_cores"]
+        == "2-3"
+    )
+    before = allocations_db._state_store.read_all()
+    online = mock_cpu_files_empty["online"]
+    if failure == "missing":
+        online.unlink()
+    else:
+        online.write_text("not a CPU list")
+    for grant, fields in (
+        ("allocate_cores", {"num_of_cores": 1}),
+        ("allocate_cores_percent", {"percent": 25}),
+        ("allocate_numa_cores", {"num_of_cores": 1, "numa_node": 0}),
+    ):
+        assert "error" in request(pool, grant, service="other", **fields)
+    listing = request(pool, "list_allocations")
+    assert listing["allocations"][0]["allocated_cores"] == "2-3"
+    assert listing["allocations"][0]["preemption_policy"] == "non-preemptive"
+    assert listing["total_allocated_cpus"] == 2
+    assert listing["total_available_cpus"] == listing["remaining_available_cpus"] == 0
+    assert listing["cpu_pool"] == {
+        "source": "configured",
+        "configured_cpus": "2-5",
+        "eligible_cpus": "",
+        "unavailable_allocated_cpus": "2-3",
+    }
+    assert "CPU capacity unavailable" in caplog.text
+    assert allocations_db._state_store.read_all() == before
+    result = request(pool, action, **params)
+    assert "error" not in result, result
+    assert result["total_available_cpus"] == result["remaining_available_cpus"] == 0
+    assert AllocationsDB().get_allocation("owner") is None
+    assert request(pool, "list_allocations")["allocations"] == []
+    online.write_text("0-7")
+    assert request(pool, "list_allocations")["cpu_pool"]["eligible_cpus"] == "2-5"
+    assert request(pool, num_of_cores=1)["allocated_cores"] == "2"

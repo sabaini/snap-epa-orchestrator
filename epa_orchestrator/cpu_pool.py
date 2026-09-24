@@ -23,6 +23,7 @@ from . import cpu_pinning
 from .utils import to_ranges
 
 ONLINE_CPUS_PATH = "/sys/devices/system/cpu/online"
+VALIDATED_POOL_OPTION = "internal.validated-cpu-pool"
 # Bound range expansion when membership in the present topology is not enforced.
 MAX_CPU_ID = 65535
 
@@ -69,9 +70,14 @@ def read_snap_cpu_pool() -> Optional[str]:
     Document output distinguishes an unset/null key from an explicit empty string.
     snap set can encode a single CPU ID as a JSON integer as well as a string.
     """
+    return _read_snap_pool_option("cpu-pool")
+
+
+def _read_snap_pool_option(key: str) -> Optional[str]:
+    """Read a pool option, including the hook's transactionally saved validation record."""
     try:
         result = subprocess.run(
-            ["snapctl", "get", "-d", "cpu-pool"],
+            ["snapctl", "get", "-d", key],
             check=True,
             capture_output=True,
             text=True,
@@ -81,7 +87,7 @@ def read_snap_cpu_pool() -> Optional[str]:
         raise ValueError(f"Failed to read snap cpu-pool configuration: {exc}") from exc
     if not isinstance(document, dict):
         raise ValueError("Invalid snap cpu-pool configuration document")
-    value = document.get("cpu-pool")
+    value = document.get(key)
     if type(value) is int:
         return str(value)
     if value is not None and not isinstance(value, str):
@@ -123,12 +129,19 @@ class CpuPoolProvider:
         provider.configured_cpus = frozenset()
         return provider
 
-    def snapshot(self) -> CpuPoolSnapshot:
-        """Refresh online status once for request selection and accounting."""
+    def snapshot(self, *, allow_unavailable: bool = False) -> CpuPoolSnapshot:
+        """Refresh capacity; inspection and release may conservatively report none."""
+        try:
+            online = read_cpu_list(ONLINE_CPUS_PATH)
+        except ValueError as exc:
+            if not allow_unavailable:
+                raise
+            logging.warning("CPU capacity unavailable; reporting zero eligible CPUs: %s", exc)
+            online = frozenset()
         return CpuPoolSnapshot(
             self.source,
             self.configured_cpus,
-            self.configured_cpus & read_cpu_list(ONLINE_CPUS_PATH),
+            self.configured_cpus & online,
         )
 
     def validate_claims(self, claimed: AbstractSet[int]) -> None:
@@ -175,15 +188,32 @@ def validate_snap_configuration() -> None:
     from .allocations_db import allocations_db
 
     configuration = read_snap_cpu_pool()
+    accepted = _read_snap_pool_option(VALIDATED_POOL_OPTION)
+    normalized = "isolated"
     if configuration is not None and configuration.strip() != "isolated":
-        # Reject new operator input naming CPUs this machine does not have.
-        parse_cpu_list(configuration, read_cpu_list(cpu_pinning.PRESENT_CPUS_PATH))
+        normalized = to_ranges(sorted(parse_cpu_list(configuration)))
+        if normalized != accepted:
+            # Only new input requires present CPUs. Refresh can replay an accepted
+            # pool after hardware disappears; startup retains those IDs as unavailable.
+            parse_cpu_list(configuration, read_cpu_list(cpu_pinning.PRESENT_CPUS_PATH))
     provider = CpuPoolProvider(configuration)
     provider.validate_claims(allocations_db.get_claimed_cpus())
+    if normalized != accepted:
+        # snapctl writes join the configure-hook transaction, so failed changes
+        # cannot replace the last accepted pool. Do not use a separate state file.
+        try:
+            subprocess.run(
+                ["snapctl", "set", f"{VALIDATED_POOL_OPTION}={json.dumps(normalized)}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(f"Failed to record validated cpu-pool configuration: {exc}") from exc
 
 
 def main() -> None:
-    """Report a clear hook error without committing any secondary configuration."""
+    """Report a clear hook error, rolling back the snap configuration transaction."""
     try:
         validate_snap_configuration()
     except Exception as exc:
