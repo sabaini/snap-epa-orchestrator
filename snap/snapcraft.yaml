@@ -47,7 +47,7 @@ apps:
 
 hooks:
   configure:
-    # Validates new cpu-pool settings and transactionally records the accepted pool.
+    # Validates new general cpu-pool settings and transactionally records the accepted pool.
     environment:
       PYTHONPATH: $SNAP/lib/python3.14/site-packages
 

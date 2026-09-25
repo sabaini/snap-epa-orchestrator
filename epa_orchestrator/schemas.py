@@ -10,6 +10,13 @@ from pydantic import BaseModel, Field, field_validator
 API_VERSION: Literal["1.0"] = "1.0"
 
 
+class CpuPoolName(str, Enum):
+    """CPU resource pools; omitted request selectors always target isolated CPUs."""
+
+    ISOLATED = "isolated"
+    GENERAL = "general"
+
+
 class PreemptionPolicy(str, Enum):
     """Ownership protection, independent of NUMA placement and scheduler preemption."""
 
@@ -31,6 +38,7 @@ class ActionType(str, Enum):
 class AllocateCoresRequest(BaseModel):
     """Request model for allocating cores (non-NUMA)."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.ALLOCATE_CORES]
     preemption_policy: Optional[PreemptionPolicy] = None
@@ -44,6 +52,7 @@ class AllocateCoresRequest(BaseModel):
 class AllocateCoresPercentRequest(BaseModel):
     """Request model for allocating a percentage of eligible CPUs."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.ALLOCATE_CORES_PERCENT]
     preemption_policy: Optional[PreemptionPolicy] = None
@@ -58,6 +67,7 @@ class AllocateCoresPercentRequest(BaseModel):
 class ListAllocationsRequest(BaseModel):
     """Request model for listing allocations."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.LIST_ALLOCATIONS]
     service_name: Optional[str] = Field(
@@ -75,6 +85,7 @@ class AllocateNumaCoresRequest(BaseModel):
         - num_of_cores == 0: invalid
     """
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.ALLOCATE_NUMA_CORES]
     preemption_policy: Optional[PreemptionPolicy] = None
@@ -137,6 +148,7 @@ EpaRequest = Annotated[
 class AllocateCoresResponse(BaseModel):
     """Pydantic model for allocate cores response."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     preemption_policy: Optional[PreemptionPolicy] = None
     service_name: str = Field(description="Name of the service that was allocated cores")
@@ -153,6 +165,7 @@ class AllocateCoresResponse(BaseModel):
 class AllocateCoresPercentResponse(BaseModel):
     """Pydantic model for allocate cores percent response."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     preemption_policy: Optional[PreemptionPolicy] = None
     service_name: str = Field(description="Name of the service that was allocated cores")
@@ -167,6 +180,7 @@ class AllocateCoresPercentResponse(BaseModel):
 class AllocateNumaCoresResponse(BaseModel):
     """Pydantic model for NUMA allocate cores response."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     preemption_policy: Optional[PreemptionPolicy] = None
     service_name: str = Field(description="Name of the service that was allocated cores")
@@ -182,6 +196,7 @@ class AllocateNumaCoresResponse(BaseModel):
 class SnapAllocation(BaseModel):
     """Model for service allocation information."""
 
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     preemption_policy: PreemptionPolicy = PreemptionPolicy.LEGACY
     service_name: str = Field(description="Name of the service")
     allocated_cores: str = Field(description="Comma-separated list of allocated CPU ranges")
@@ -204,8 +219,9 @@ class ListAllocationsResponse(BaseModel):
     """Pydantic model for list allocations response."""
 
     supported_cpu_features: List[str] = Field(
-        default_factory=lambda: ["non-preemptive-allocations"]
+        default_factory=lambda: ["non-preemptive-allocations", "cpu-pools"]
     )
+    pool: CpuPoolName = CpuPoolName.ISOLATED
     version: Literal["1.0"] = Field(default=API_VERSION)
     total_allocations: int = Field(description="Total number of service allocations")
     total_allocated_cpus: int = Field(

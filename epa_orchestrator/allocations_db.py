@@ -22,7 +22,7 @@ from .cpu_pinning import (
     calculate_cpu_pinning,
     get_thread_siblings_map,
 )
-from .schemas import PreemptionPolicy, SnapAllocation
+from .schemas import CpuPoolName, PreemptionPolicy, SnapAllocation
 from .state_store import StateCorruptionError, StateStore
 from .utils import (
     get_cpus_in_numa_node,
@@ -53,6 +53,7 @@ class AllocationsDB:
         """Initialize the allocations database."""
         self._in_transaction = False
         self._preemption_policies: Dict[str, PreemptionPolicy] = {}
+        self._allocation_pools: Dict[str, CpuPoolName] = {}
         self._allocations: Dict[str, str] = {}
         self._allocated_cpus: Set[int] = set()
         self._explicit_allocations: Dict[str, str] = {}
@@ -99,6 +100,18 @@ class AllocationsDB:
             return None
         return self._preemption_policies.get(service_name, PreemptionPolicy.LEGACY)
 
+    def ensure_service_pool(self, service_name: str, pool: CpuPoolName) -> None:
+        """Reject cross-pool changes, including releases, while the service owns CPUs."""
+        self._load_from_store()
+        if service_name in self._allocations and self._service_pool(service_name) != pool:
+            raise ValueError(
+                f"Service {service_name} owns CPUs in pool {self._service_pool(service_name).value}; "
+                "release that allocation in its pool before switching pools"
+            )
+
+    def _service_pool(self, service_name: str) -> CpuPoolName:
+        return self._allocation_pools.get(service_name, CpuPoolName.ISOLATED)
+
     def _parse_cpu_ranges(self, cpu_ranges: str) -> set[int]:
         """Parse CPU range string into a set of CPU numbers."""
         return set(parse_cpu_ranges(cpu_ranges))
@@ -114,6 +127,7 @@ class AllocationsDB:
             old_explicit = self._parse_cpu_ranges(self._explicit_allocations.pop(service_name))
             self._explicitly_allocated_cpus -= old_explicit
         self._preemption_policies.pop(service_name, None)
+        self._allocation_pools.pop(service_name, None)
         return removed
 
     def _snapshot(self) -> Dict[str, object]:
@@ -122,6 +136,7 @@ class AllocationsDB:
             "allocations": dict(self._allocations),
             "explicit_allocations": dict(self._explicit_allocations),
             "preemption_policies": dict(self._preemption_policies),
+            "allocation_pools": dict(self._allocation_pools),
         }
 
     def _load_from_store(self) -> None:
@@ -154,12 +169,27 @@ class AllocationsDB:
         if any(name not in self._allocations for name in self._preemption_policies):
             raise StateCorruptionError("Preemption policy without owned CPUs")
 
+        self._load_pool_metadata(data)
+
         self._allocated_cpus = set()
         self._explicitly_allocated_cpus = set()
         for cores_str in self._allocations.values():
             self._allocated_cpus.update(self._parse_cpu_ranges(cores_str))
         for cores_str in self._explicit_allocations.values():
             self._explicitly_allocated_cpus.update(self._parse_cpu_ranges(cores_str))
+
+    def _load_pool_metadata(self, data: Dict[str, Any]) -> None:
+        """Decode pool ownership without inferring it from mutable host topology."""
+        pools = data.get("allocation_pools", {})
+        if not isinstance(pools, dict):
+            raise StateCorruptionError("Invalid allocation_pools mapping")
+        try:
+            self._allocation_pools = {name: CpuPoolName(value) for name, value in pools.items()}
+        except (ValueError, TypeError) as error:
+            raise StateCorruptionError("Invalid stored CPU pool") from error
+
+        if any(name not in self._allocations for name in self._allocation_pools):
+            raise StateCorruptionError("CPU pool without owned CPUs")
 
     def _apply_allocation(self, service_name: str, cpu_set: set[int], explicit: bool) -> None:
         """Apply an allocation to a service, updating all tracking structures."""
@@ -182,6 +212,7 @@ class AllocationsDB:
         *,
         requester: Optional[str] = None,
         requester_policy: Optional[PreemptionPolicy] = None,
+        requester_pool: CpuPoolName = CpuPoolName.ISOLATED,
     ) -> None:
         """Subtract given CPUs from a service allocation, remove entry if empty."""
         if service_name not in self._allocations:
@@ -190,8 +221,9 @@ class AllocationsDB:
         if not (current_set & cpus_to_remove):
             return
         if requester is not None and requester != service_name:
+            self.ensure_service_pool(requester, requester_pool)
             policy = self._effective_policy(requester, requester_policy)
-            self._validate_reclamation(service_name, cpus_to_remove, policy)
+            self._validate_reclamation(service_name, cpus_to_remove, policy, requester_pool)
         remaining = current_set - cpus_to_remove
         # Update global allocated CPUs
         self._allocated_cpus -= current_set & cpus_to_remove
@@ -209,6 +241,7 @@ class AllocationsDB:
         else:
             del self._allocations[service_name]
             self._preemption_policies.pop(service_name, None)
+            self._allocation_pools.pop(service_name, None)
 
     def get_available_cpus(self, total_cpus: str) -> list[int]:
         """Get list of available CPUs that haven't been allocated.
@@ -266,8 +299,11 @@ class AllocationsDB:
         service_name: str,
         allocated_cores: str,
         preemption_policy: Optional[PreemptionPolicy] = None,
+        *,
+        pool: CpuPoolName = CpuPoolName.ISOLATED,
     ) -> None:
         """Replace an owner's allocation, rejecting overlap before changing any state."""
+        self.ensure_service_pool(service_name, pool)
         if not allocated_cores:
             return
         policy = self._effective_policy(service_name, preemption_policy)
@@ -281,6 +317,7 @@ class AllocationsDB:
         self._remove_service_allocation(service_name)
         self._apply_allocation(service_name, new_cpu_set, explicit=False)
         self._preemption_policies[service_name] = policy
+        self._allocation_pools[service_name] = pool
 
     @_mutating
     def allocate_count(
@@ -290,9 +327,11 @@ class AllocationsDB:
         eligible_cpus: str,
         preemption_policy: Optional[PreemptionPolicy] = None,
         *,
+        pool: CpuPoolName = CpuPoolName.ISOLATED,
         check_online: Callable[[AbstractSet[int]], None],
     ) -> tuple[str, str]:
         """Select and commit ordinary CPUs with capacity validation under the state lock."""
+        self.ensure_service_pool(service_name, pool)
         policy = self._effective_policy(service_name, preemption_policy)
         candidates = set(self.get_available_cpus_for_service(service_name, eligible_cpus))
         self._check_offline_claims(service_name, self._parse_cpu_ranges(eligible_cpus))
@@ -311,7 +350,7 @@ class AllocationsDB:
             shared = to_ranges(sorted(candidates - selected))
         self._validate_selection(selected, candidates, target_count)
         check_online(selected)
-        self.allocate_cores(service_name, dedicated, policy)
+        self.allocate_cores(service_name, dedicated, policy, pool=pool)
         return shared, dedicated
 
     def _check_offline_claims(self, service_name: str, eligible: AbstractSet[int]) -> None:
@@ -333,10 +372,15 @@ class AllocationsDB:
             raise ValueError(f"Failed to select exactly {count} eligible CPUs")
 
     def _validate_reclamation(
-        self, owner: str, cpus: set[int], requester_policy: PreemptionPolicy
+        self,
+        owner: str,
+        cpus: set[int],
+        requester_policy: PreemptionPolicy,
+        requester_pool: CpuPoolName = CpuPoolName.ISOLATED,
     ) -> None:
         if (
-            requester_policy == PreemptionPolicy.NON_PREEMPTIVE
+            self._service_pool(owner) != requester_pool
+            or requester_policy == PreemptionPolicy.NON_PREEMPTIVE
             or self._effective_policy(owner) == PreemptionPolicy.NON_PREEMPTIVE
             or cpus & self._get_service_explicit_set(owner)
         ):
@@ -348,6 +392,7 @@ class AllocationsDB:
         numa_node: int,
         eligible_cpus: AbstractSet[int],
         preemption_policy: Optional[PreemptionPolicy] = None,
+        pool: CpuPoolName = CpuPoolName.ISOLATED,
     ) -> Tuple[Set[int], Set[int]]:
         """Exclude foreign claims according to both requester and owner policy."""
         policy = self._effective_policy(service_name, preemption_policy)
@@ -357,7 +402,8 @@ class AllocationsDB:
             if owner == service_name:
                 continue
             if (
-                policy == PreemptionPolicy.NON_PREEMPTIVE
+                self._service_pool(owner) != pool
+                or policy == PreemptionPolicy.NON_PREEMPTIVE
                 or self._effective_policy(owner) == PreemptionPolicy.NON_PREEMPTIVE
             ):
                 unavailable.update(self._get_service_allocation_set(owner))
@@ -381,10 +427,12 @@ class AllocationsDB:
         new_cores_in_node: Set[int],
         preemption_policy: Optional[PreemptionPolicy] = None,
         *,
+        pool: CpuPoolName = CpuPoolName.ISOLATED,
         eligible_cpus: AbstractSet[int],
         check_online: Callable[[AbstractSet[int]], None],
     ) -> None:
         """Validate pool, ownership and online status before changing any candidate claim."""
+        self.ensure_service_pool(service_name, pool)
         policy = self._effective_policy(service_name, preemption_policy)
         eligible = get_cpus_in_numa_node(numa_node, to_ranges(sorted(eligible_cpus)))
         if not new_cores_in_node <= eligible:
@@ -397,7 +445,7 @@ class AllocationsDB:
         }
         for owner, overlap in overlaps.items():
             if overlap:
-                self._validate_reclamation(owner, overlap, policy)
+                self._validate_reclamation(owner, overlap, policy, pool)
         current = self._get_service_allocation_set(service_name)
         in_node = get_cpus_in_numa_node(numa_node, to_ranges(sorted(current)))
         remaining_explicit = self._get_service_explicit_set(service_name) - in_node
@@ -406,7 +454,11 @@ class AllocationsDB:
         self._subtract_cpus_from_service(service_name, in_node)
         for owner, overlap in overlaps.items():
             self._subtract_cpus_from_service(
-                owner, overlap, requester=service_name, requester_policy=policy
+                owner,
+                overlap,
+                requester=service_name,
+                requester_policy=policy,
+                requester_pool=pool,
             )
         updated = (current - in_node) | new_cores_in_node
         if updated:
@@ -417,6 +469,7 @@ class AllocationsDB:
                 self._explicit_allocations[service_name] = to_ranges(sorted(explicit))
                 self._explicitly_allocated_cpus.update(explicit)
             self._preemption_policies[service_name] = policy
+            self._allocation_pools[service_name] = pool
 
     @_mutating
     def allocate_numa_cores(
@@ -426,10 +479,12 @@ class AllocationsDB:
         num_of_cores: int,
         preemption_policy: Optional[PreemptionPolicy] = None,
         *,
+        pool: CpuPoolName = CpuPoolName.ISOLATED,
         eligible_cpus: AbstractSet[int],
         check_online: Callable[[AbstractSet[int]], None],
     ) -> Tuple[str, str]:
         """Select exactly the requested node capacity, or release that owner's node claims."""
+        self.ensure_service_pool(service_name, pool)
         if num_of_cores == 0:
             return "", ""
         if num_of_cores == -1:
@@ -441,7 +496,7 @@ class AllocationsDB:
         policy = self._effective_policy(service_name, preemption_policy)
         self._check_offline_claims(service_name, eligible_cpus)
         candidates, rejected = self._get_allocatable_numa_cpus(
-            service_name, numa_node, eligible_cpus, policy
+            service_name, numa_node, eligible_cpus, policy, pool
         )
         if len(candidates) < num_of_cores:
             return "", to_ranges(sorted(rejected))
@@ -458,6 +513,7 @@ class AllocationsDB:
             policy,
             eligible_cpus=eligible_cpus,
             check_online=check_online,
+            pool=pool,
         )
         return to_ranges(sorted(selected)), ""
 
@@ -561,7 +617,7 @@ class AllocationsDB:
         self._load_from_store()
         return self._allocations.get(service_name)
 
-    def get_all_allocations(self) -> list[SnapAllocation]:
+    def get_all_allocations(self, pool: Optional[CpuPoolName] = None) -> list[SnapAllocation]:
         """Get all service allocations.
 
         Returns:
@@ -571,16 +627,20 @@ class AllocationsDB:
         return [
             SnapAllocation(
                 service_name=service_name,
+                pool=self._service_pool(service_name),
                 allocated_cores=cores,
                 cores_count=len(self._parse_cpu_ranges(cores)),
                 is_explicit=service_name in self._explicit_allocations,
                 preemption_policy=self._effective_policy(service_name),
             )
             for service_name, cores in self._allocations.items()
+            if pool is None or self._service_pool(service_name) == pool
         ]
 
     @_mutating
-    def remove_allocation(self, service_name: str) -> bool:
+    def remove_allocation(
+        self, service_name: str, *, pool: CpuPoolName = CpuPoolName.ISOLATED
+    ) -> bool:
         """Remove allocation for a specific service.
 
         Args:
@@ -590,6 +650,7 @@ class AllocationsDB:
             True if allocation was removed, False if not found
         """
         self._load_from_store()
+        self.ensure_service_pool(service_name, pool)
         if service_name in self._allocations or service_name in self._explicit_allocations:
             self._remove_service_allocation(service_name)
             logging.info(f"Removed allocation for service {service_name}")
@@ -606,11 +667,18 @@ class AllocationsDB:
         self._explicitly_allocated_cpus.clear()
         logging.info("Cleared all allocations")
         self._preemption_policies.clear()
+        self._allocation_pools.clear()
 
-    def get_claimed_cpus(self) -> set[int]:
+    def get_claimed_cpus(self, pool: Optional[CpuPoolName] = None) -> set[int]:
         """Return all recorded claims, without reloading inside a transaction."""
         self._load_from_store()
-        return set(self._allocated_cpus)
+        return set().union(
+            *(
+                self._parse_cpu_ranges(cores)
+                for name, cores in self._allocations.items()
+                if pool is None or self._service_pool(name) == pool
+            )
+        )
 
     def get_snap_allocation_count(self, service_name: str) -> int:
         """Get the number of CPUs allocated to a specific service.

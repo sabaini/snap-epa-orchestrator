@@ -15,7 +15,7 @@ import pytest
 from pydantic import parse_obj_as
 
 from epa_orchestrator.allocations_db import allocations_db
-from epa_orchestrator.cpu_pool import CpuPoolProvider
+from epa_orchestrator.cpu_pool import CpuPools
 from epa_orchestrator.daemon_handler import handle_daemon_request
 from epa_orchestrator.schemas import (
     ActionType,
@@ -98,7 +98,7 @@ class TestSocketCommunication:
         self, socket_daemon, socket_path, mock_cpu_files_empty
     ):
         """Count, percentage and NUMA succeed without isolation and persist real IDs."""
-        provider = CpuPoolProvider("2-5")
+        provider = CpuPools("2-5")
         with (
             patch("epa_orchestrator.daemon_handler.get_cpu_pool_provider", return_value=provider),
             patch(
@@ -112,7 +112,12 @@ class TestSocketCommunication:
                 ("allocate_cores_percent", {"percent": 50}, "allocated_cores"),
                 ("allocate_numa_cores", {"num_of_cores": 2, "numa_node": 0}, "cores_allocated"),
             ):
-                payload = {"action": action, "service_name": "configured", **params}
+                payload = {
+                    "action": action,
+                    "service_name": "configured",
+                    "pool": "general",
+                    **params,
+                }
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.connect(socket_path)
                     client.sendall(json.dumps(payload).encode())
@@ -366,7 +371,7 @@ class TestSocketCommunication:
     ):
         """The socket protocol protects claims with either isolated or ordinary CPUs."""
         if configured_mode:
-            provider = CpuPoolProvider("0-3")
+            provider = CpuPools("0-3")
             monkeypatch.setattr(
                 "epa_orchestrator.daemon_handler.get_cpu_pool_provider", lambda: provider
             )
@@ -378,7 +383,13 @@ class TestSocketCommunication:
         )
 
         def request(action, service="a", **fields):
-            payload = {"version": "1.0", "action": action, "service_name": service, **fields}
+            payload = {
+                "version": "1.0",
+                "action": action,
+                "service_name": service,
+                "pool": "general" if configured_mode else "isolated",
+                **fields,
+            }
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(socket_path)
                 client.sendall(json.dumps(payload).encode())

@@ -49,7 +49,7 @@ This heuristic leaves CPUs unallocated within EPA's accounting; it does not rese
 The NUMA-aware allocation action allows services to request a specific number of cores from a particular NUMA node:
 
 - **NUMA Locality**: Cores are allocated from the specified NUMA node to ensure optimal memory access patterns.
-- **Legacy Reallocation**: Legacy NUMA requests may reclaim non-explicit legacy allocations from other services. Non-preemptive requests never reclaim foreign claims, and protected claims cannot be reclaimed by any requester.
+- **Legacy Reallocation**: Legacy NUMA requests may reclaim non-explicit legacy allocations from other services in the same pool. Non-preemptive requests never reclaim foreign claims, and protected claims cannot be reclaimed by any requester.
 - **Atomic Exact-Count**: If fewer than the requested number of cores are available in the NUMA node, the request fails with an error; no partial allocation occurs.
 - **Protection**: Explicit NUMA allocations remain protected from other services. Non-preemptive policy additionally protects ordinary/percentage claims.
 - **Per-NUMA override/append semantics**: If the same service requests the same NUMA node again, it overrides previous cores from that node. If it requests a different NUMA node, the new cores are appended so the service may hold allocations across multiple NUMA nodes.
@@ -74,80 +74,137 @@ The snap runs a daemon that listens on a Unix domain socket and provides a JSON 
 
 The snap can be integrated with other snaps (e.g., openstack-hypervisor) via the slot/plug mechanism for EPA information sharing.
 
-### CPU allocation pool (`cpu-pool`)
+### CPU pools and the `cpu-pool` setting
 
-By default (unset or `isolated`), EPA uses the CPUs listed in
-`/sys/devices/system/cpu/isolated`. An empty isolated list means zero capacity;
-there is **no fallback to all host CPUs**. To allocate ordinary online CPUs instead:
+EPA maintains two named pools:
+
+- `isolated`: CPUs from `/sys/devices/system/cpu/isolated`. This is always the
+  default when a request omits `pool`, including when a general pool is configured.
+- `general`: an explicitly configured set of non-isolated CPUs. It is unavailable
+  until the operator configures it. CPUs not assigned to either pool remain outside
+  EPA's allocation capacity; leave appropriate capacity for host housekeeping.
+
+Configure the general pool with CPU IDs present on the machine and outside the
+isolated set, then restart the daemon:
 
 ```sh
-sudo snap set epa-orchestrator cpu-pool='2-15,18-31'
+sudo snap set epa-orchestrator cpu-pool='2-7'
 sudo snap restart epa-orchestrator.daemon
 ```
 
-Choose CPU IDs present on your machine. Lists accept non-negative IDs and inclusive
-ranges; ordering, duplicates and surrounding whitespace are normalized. Empty
-components, descending ranges, negative IDs, nonexistent CPUs and kernel stride/group
-expressions are rejected. An explicit empty string is invalid. Restore the default with:
+This adds general capacity; it does **not** redirect existing clients away from
+isolated CPUs. Unsetting `cpu-pool` (or setting it to `isolated`) disables the
+optional general pool after restart. Release its claims before disabling it.
 
-```sh
-sudo snap unset epa-orchestrator cpu-pool
-sudo snap restart epa-orchestrator.daemon
+Lists accept non-negative IDs and inclusive ranges; ordering, duplicates and
+whitespace normalize. Empty strings/components, descending ranges, negative IDs,
+nonexistent CPUs, kernel stride/group expressions, and overlap with isolated CPUs
+are rejected. Both pools are fixed at startup. Online status is refreshed per
+request: `eligible = configured ∩ online`, `free = eligible − claimed`.
+
+### Pool selection and compatibility
+
+`list_allocations`, `allocate_cores`, `allocate_numa_cores`, and
+`allocate_cores_percent` accept `pool: "isolated" | "general"`:
+
+- Omitted `pool` always selects `isolated`; it does not inherit a service's pool.
+- Every successful CPU response confirms the selected name in `pool`. Existing
+  fields and types are preserved: count/percentage return `allocated_cores`, while
+  NUMA returns the range string in `cores_allocated`.
+- Listing returns only the selected pool's owners and totals. Each allocation
+  entry includes its `pool`. Inspect both pools with separate explicit requests.
+- Count, percentage, and NUMA selection use only the selected pool. Percentages
+  are calculated from that pool's complete eligible capacity. `shared_cpus` also
+  stays within that pool; it never includes housekeeping CPUs or another pool.
+- Unknown pool names, an unconfigured general pool, and unsatisfiable allocation
+  requests return errors. No action falls back to another pool. Listing an empty
+  configured pool succeeds; releases do not require free capacity.
+- A service can own CPUs in only one pool. Requests selecting a different pool,
+  including releases, fail without changing its claims. Stop or migrate its
+  workload and fully release in the original pool before switching. Per-node
+  release removes only that node's claims and retains the service's pool while
+  any other claims remain. A legacy release cannot release general claims.
+- Pool selection and ownership policy are independent. Both pools default new
+  services to the legacy policy. Select `preemption_policy: "non-preemptive"`
+  explicitly when ownership must remain protected.
+
+Before requesting general CPUs, use the default `list_allocations` request to
+require `cpu-pools` in `supported_cpu_features`. Then query
+`{"action":"list_allocations","pool":"general"}` to inspect general capacity.
+Older daemons may silently ignore unknown request fields: verify support before
+allocating and require the returned `pool` to match before applying CPU affinity.
+
+For example, after configuring general CPUs `2-7`:
+
+```json
+{
+  "version": "1.0",
+  "action": "allocate_numa_cores",
+  "service_name": "ceph-osd.0",
+  "pool": "general",
+  "numa_node": 0,
+  "num_of_cores": 4,
+  "preemption_policy": "non-preemptive"
+}
 ```
 
-The configured pool is fixed at daemon startup. Online status is refreshed per request:
-`eligible = configured ∩ online`, `free = eligible − claimed`. Offline configured CPUs
-remain in the configuration but cannot be granted, and a CPU that leaves the machine's
-present topology behaves the same way: it stays configured and owned, never eligible.
-A final online check rejects a selected CPU that became unavailable with an error asking
-the client to retry, without changing allocations. CPUs can still go offline after a
-successful response.
+Existing Nova/DPDK requests that omit the selector continue using isolated CPUs,
+including percentage requests, shared-CPU results, and per-node releases. Saved
+claims without pool metadata belong to `isolated`; malformed metadata is an error.
+For experimental deployments of this PR's earlier global-pool implementation,
+stop/release ordinary-CPU claims before upgrading, then recreate them explicitly
+in `general`. Do not downgrade to binaries without pool support while general
+claims exist: those binaries cannot enforce this ownership boundary.
 
-The configure hook rejects a **new** setting naming CPUs this machine does not have, so
-operator input is still validated against present topology. Once accepted, an unchanged
-pool (including equivalent CPU-list formatting) remains valid during refresh even if
-CPUs disappear. The hook maintains `internal.validated-cpu-pool` in the same snap
-configuration transaction; this is internal bookkeeping, not an operator setting.
+### Topology changes and recovery
 
-If pool discovery fails at startup (unreadable `cpu-pool` setting or CPU topology), the daemon logs the
-error and starts with zero capacity: `list_allocations` and releases keep working while
-new allocations are refused until the underlying problem is fixed.
+The configure hook checks new general-pool settings against present topology and
+rejects settings that exclude existing general owners, even offline ones. Isolated
+owners are validated against the isolated pool separately. An unchanged accepted
+setting survives refresh even if CPUs disappear. The hook maintains
+`internal.validated-cpu-pool` within the same snap configuration transaction;
+this is internal bookkeeping, not an operator setting.
 
-If online topology cannot be read, listing still shows all saved claims and releases
-remain available. Capacity and eligible CPUs are conservatively reported as zero/empty,
-all saved claims are shown as unavailable, and the daemon logs the discovery error.
-New allocations fail until topology can be read again. Per-node release still requires
-NUMA topology; use full-service release if node membership is also unavailable.
+Offline or absent CPUs stay configured and owned but cannot be granted. A final
+online check rejects CPUs lost during selection before changing any claims.
+If a CPU changes isolation status across reboot, recorded ownership still prevents
+it from being reassigned through the other pool. An overlapping general setting
+blocks general grants until repaired; existing claims remain recoverable.
 
-**Pool eligibility is accounting, not kernel isolation.** EPA does not activate scheduler
-isolation or IRQ isolation. CPU affinity, IRQ placement, kernel housekeeping and exclusion
-of unrelated host workloads remain deployment responsibilities. Counts are logical CPUs;
-NUMA placement retains sibling-aware selection but never adds siblings outside the pool.
+Discovery failures are logged and leave the affected pool at zero capacity for
+listing and release. Failure to discover isolated CPUs also blocks general grants,
+since their separation cannot be verified. A failed general configuration read does
+not disable a successfully discovered isolated pool. New capacity requires fixing
+startup discovery and restarting; online status is retried on each request.
 
-Before shrinking a pool (including returning to `isolated`), coordinate workload release
-or migration. The configure hook rejects settings that exclude any saved owner, even if
-that CPU is offline. Supersets are allowed. A claim made between hook validation and restart
-can still conflict: the restarted daemon then serves listing/releases but blocks new CPU
-allocations until the conflict is resolved. No claims are erased. Full-service release
-(`allocate_cores` with `num_of_cores: -1`, or percentage `0`/`-1`) works with an empty pool.
-NUMA release ignores pool membership but requires node topology; if topology disappears,
-use full-service release. Replacing a service with unavailable existing claims is
-rejected rather than silently discarding those claims: explicitly coordinate their
-release first. An uncertain state commit blocks all mutations, including releases,
-until the documented storage recovery procedure completes.
+If online topology cannot be read, listing still shows the selected pool's saved
+claims and reports zero eligible/free capacity. Full-service release remains
+available with `allocate_cores` and `num_of_cores: -1`, or percentage `0`/`-1`,
+using the original pool selector. NUMA release needs node topology; use full-service
+release when node membership is unavailable. Disabling a pool is rejected while
+it has claims; if configuration was lost outside the hook, restore it to regain
+access to that pool. Claims are never silently discarded.
 
-Capacity fields retain their names:
+A claim made between hook validation and daemon restart can still conflict with
+a changed configuration: new grants in that pool are blocked until the conflict
+is resolved. An uncertain state commit blocks all mutations, including releases,
+until the [storage recovery procedure](docs/nonpreemptive-allocations.md) completes.
 
-- `total_available_cpus`: the complete eligible pool size, including owned CPUs.
-- `remaining_available_cpus`: unclaimed eligible CPUs; never negative.
-- `total_allocated_cpus`: all recorded claims, including currently unavailable CPUs, so
-  it can exceed current capacity. Offlining does not release ownership; a returning CPU
-  remains owned.
-- `shared_cpus`: unallocated eligible CPUs, **not** all remaining host CPUs.
+Capacity fields retain their names and describe the selected pool:
+
+- `total_available_cpus`: complete eligible capacity, including owned CPUs.
+- `remaining_available_cpus`: eligible CPUs not claimed by any service.
+- `total_allocated_cpus`: recorded claims in this pool, including unavailable CPUs;
+  it can exceed current capacity. Offlining does not release ownership.
+- `shared_cpus`: unallocated eligible CPUs within the selected pool.
 - `list_allocations.cpu_pool`: active source (`isolated` or `configured`),
-  `configured_cpus`, `eligible_cpus`, and `unavailable_allocated_cpus`, using normalized
-  CPU range strings. This reports the daemon's active choice, not a pending snap setting.
-  Saved allocations remain visible even when no CPUs are eligible.
+  `configured_cpus`, `eligible_cpus`, and `unavailable_allocated_cpus`. These are
+  normalized CPU range strings and describe the active daemon configuration.
+
+**Pool eligibility is accounting, not kernel isolation.** EPA does not configure
+scheduler/IRQ isolation or workload affinity. Host housekeeping and exclusion of
+unrelated workloads remain deployment responsibilities. Counts are logical CPUs;
+NUMA selection never adds siblings outside the selected pool.
 
 ### API Usage
 
@@ -310,7 +367,8 @@ Get all current service allocations:
 ```json
 {
   "version": "1.0",
-  "supported_cpu_features": ["non-preemptive-allocations"],
+  "supported_cpu_features": ["non-preemptive-allocations", "cpu-pools"],
+  "pool": "isolated",
   "total_allocations": 2,
   "total_allocated_cpus": 4,
   "total_available_cpus": 20,
@@ -345,7 +403,8 @@ Get all current service allocations:
 ```json
 {
   "version": "1.0",
-  "supported_cpu_features": ["non-preemptive-allocations"],
+  "supported_cpu_features": ["non-preemptive-allocations", "cpu-pools"],
+  "pool": "isolated",
   "total_allocations": 0,
   "total_allocated_cpus": 0,
   "total_available_cpus": 0,

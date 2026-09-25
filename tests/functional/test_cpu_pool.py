@@ -30,10 +30,17 @@ def _request(socket_path, action, **params):
         client.connect(socket_path)
         client.sendall(
             json.dumps(
-                {"action": action, "service_name": "test-configured-pool", **params}
+                {
+                    "action": action,
+                    "service_name": "test-configured-pool",
+                    **params,
+                }
             ).encode()
         )
-        return json.loads(client.recv(65536))
+        response = json.loads(client.recv(65536))
+    if "error" not in response:
+        assert response.get("pool") == params.get("pool", "isolated"), response
+    return response
 
 
 @pytest.fixture
@@ -43,7 +50,14 @@ def configured_pool(socket_path):
     if not value:
         pytest.skip("EPA_TEST_CPU_POOL not set (disposable configured-pool guest only)")
     assert Path("/sys/devices/system/cpu/isolated").read_text().strip() == ""
-    info = _request(socket_path, "list_allocations")
+    default = _request(socket_path, "list_allocations")
+    assert "error" not in default, default
+    assert "cpu-pools" in default.get("supported_cpu_features", []), default
+    assert default["cpu_pool"]["source"] == "isolated"
+    assert default["cpu_pool"]["eligible_cpus"] == ""
+    assert default["total_available_cpus"] == 0
+    info = _request(socket_path, "list_allocations", pool="general")
+    assert "error" not in info, info
     assert info["cpu_pool"]["source"] == "configured"
     assert info["cpu_pool"]["configured_cpus"] == value
     assert info["cpu_pool"]["eligible_cpus"] == value
@@ -52,7 +66,7 @@ def configured_pool(socket_path):
     try:
         yield cpus
     finally:
-        result = _request(socket_path, "allocate_cores", num_of_cores=-1)
+        result = _request(socket_path, "allocate_cores", pool="general", num_of_cores=-1)
         assert "error" not in result
 
 
@@ -66,7 +80,7 @@ def configured_pool(socket_path):
 )
 def test_configured_pool_success(socket_path, configured_pool, action, params, field):
     """All allocation APIs must grant IDs in the configured pool, never accept errors."""
-    result = _request(socket_path, action, **params)
+    result = _request(socket_path, action, pool="general", **params)
     assert "error" not in result, result
     selected = _ids(result[field])
     expected_count = (
@@ -77,6 +91,8 @@ def test_configured_pool_success(socket_path, configured_pool, action, params, f
     assert len(selected) == expected_count
     assert selected <= configured_pool
     assert result["total_available_cpus"] == len(configured_pool)
-    listing = _request(socket_path, "list_allocations")
+    listing = _request(socket_path, "list_allocations", pool="general")
+    assert "error" not in listing, listing
+    assert all(entry.get("pool") == "general" for entry in listing["allocations"]), listing
     owner = next(e for e in listing["allocations"] if e["service_name"] == "test-configured-pool")
     assert _ids(owner["allocated_cores"]) == selected

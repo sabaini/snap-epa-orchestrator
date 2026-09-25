@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import AbstractSet, Literal, Optional
 
 from . import cpu_pinning
+from .schemas import CpuPoolName
 from .utils import to_ranges
 
 ONLINE_CPUS_PATH = "/sys/devices/system/cpu/online"
@@ -163,23 +164,60 @@ class CpuPoolProvider:
             )
 
 
-def load_startup_pool() -> CpuPoolProvider:
-    """Daemon startup: never trade introspection and releases for failed discovery."""
-    configuration: Optional[str] = None
+class CpuPools:
+    """Keep the legacy isolated pool separate from an opt-in general CPU pool."""
+
+    def __init__(self, configuration: Optional[str] = None) -> None:
+        """Freeze both pools; explicit configuration only supplies general CPUs."""
+        self.isolated = CpuPoolProvider()
+        self.general: Optional[CpuPoolProvider] = None
+        if configuration is not None and configuration.strip() != "isolated":
+            self.general = CpuPoolProvider(configuration)
+            self.validate_disjoint()
+
+    def select(self, pool: CpuPoolName) -> CpuPoolProvider:
+        """Select exactly the requested pool, never substituting another one."""
+        pool = CpuPoolName(pool)
+        if pool == CpuPoolName.ISOLATED:
+            return self.isolated
+        if self.general is None:
+            raise ValueError("CPU pool general is not configured")
+        return self.general
+
+    def validate_disjoint(self) -> None:
+        """Reject general CPU IDs which the kernel reserves for the isolated pool."""
+        if self.general is not None:
+            overlap = self.isolated.configured_cpus & self.general.configured_cpus
+            if overlap:
+                raise ValueError(
+                    f"General cpu-pool overlaps isolated CPUs: {to_ranges(sorted(overlap))}"
+                )
+
+
+def load_startup_pool() -> CpuPools:
+    """Load pools independently, retaining recovery access after discovery failures."""
+    pools = CpuPools.__new__(CpuPools)
+    isolation_known = True
+    try:
+        pools.isolated = CpuPoolProvider()
+    except Exception as exc:
+        logging.error("CPU pool discovery failed for isolated: %s", exc)
+        pools.isolated = CpuPoolProvider.without_capacity()
+        isolation_known = False
+    pools.general = None
     try:
         configuration = read_snap_cpu_pool()
-        return CpuPoolProvider(configuration)
+        if configuration is not None and configuration.strip() != "isolated":
+            pools.general = CpuPoolProvider(configuration)
+            if not isolation_known:
+                raise ValueError("Cannot validate general pool without isolated CPU topology")
+            pools.validate_disjoint()
     except Exception as exc:
-        # The snap option is unknown when snapctl itself failed, so report the default.
-        source: Literal["isolated", "configured"] = (
-            "isolated"
-            if configuration is None or configuration.strip() == "isolated"
-            else "configured"
-        )
-        logging.error(
-            "CPU pool discovery failed; serving with zero capacity until it is fixed: %s", exc
-        )
-        return CpuPoolProvider.without_capacity(source)
+        logging.error("CPU pool discovery failed for general: %s", exc)
+        # Unknown/invalid configuration is unavailable, never an alternate pool.
+        # Keep the named recovery endpoint available for existing general claims.
+        pools.general = CpuPoolProvider.without_capacity("configured")
+    return pools
 
 
 def validate_snap_configuration() -> None:
@@ -196,8 +234,12 @@ def validate_snap_configuration() -> None:
             # Only new input requires present CPUs. Refresh can replay an accepted
             # pool after hardware disappears; startup retains those IDs as unavailable.
             parse_cpu_list(configuration, read_cpu_list(cpu_pinning.PRESENT_CPUS_PATH))
-    provider = CpuPoolProvider(configuration)
-    provider.validate_claims(allocations_db.get_claimed_cpus())
+    pools = CpuPools(configuration)
+    for pool in CpuPoolName:
+        claimed = allocations_db.get_claimed_cpus(pool)
+        if pool == CpuPoolName.GENERAL and pools.general is None and not claimed:
+            continue
+        pools.select(pool).validate_claims(claimed)
     if normalized != accepted:
         # snapctl writes join the configure-hook transaction, so failed changes
         # cannot replace the last accepted pool. Do not use a separate state file.

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from unittest.mock import Mock
 
-from epa_orchestrator.cpu_pool import CpuPoolProvider
+from epa_orchestrator.cpu_pool import CpuPools
 
 DAEMON_PATH = Path(__file__).parents[2] / "bin" / "daemon"
 
@@ -40,11 +40,11 @@ def test_daemon_main_wires_startup_pool_into_requests(mock_cpu_files_empty, monk
     """main() must pass the startup pool to startup validation and the dispatcher.
 
     With an empty isolated list, dropping the provider argument would silently fall
-    back to the lazy isolated-mode provider: the listing would report "isolated" and
-    the grant would fail with "No CPUs available", failing this test loudly.
+    back to the lazy isolated-only provider: an explicit general request would fail
+    as unconfigured, failing this test loudly. Omitted selectors stay isolated.
     """
     daemon = _load_daemon_module()
-    provider = CpuPoolProvider("2-5")
+    provider = CpuPools("2-5")
     validate = Mock()
     monkeypatch.setattr(daemon, "load_startup_pool", lambda: provider)
     monkeypatch.setattr(daemon, "validate_startup_pool", validate)
@@ -72,6 +72,11 @@ def test_daemon_main_wires_startup_pool_into_requests(mock_cpu_files_empty, monk
             time.sleep(0.05)
 
     validate.assert_called_once_with(provider)
+    assert listing["pool"] == "isolated"
+    assert listing["total_available_cpus"] == 0
+    assert "error" in _request(daemon.SOCKET_PATH, "allocate_cores", num_of_cores=1)
+    listing = _request(daemon.SOCKET_PATH, "list_allocations", pool="general")
+    assert listing["pool"] == "general"
     assert listing["cpu_pool"] == {
         "source": "configured",
         "configured_cpus": "2-5",
@@ -80,7 +85,7 @@ def test_daemon_main_wires_startup_pool_into_requests(mock_cpu_files_empty, monk
     }
     assert "non-preemptive-allocations" in listing["supported_cpu_features"]
 
-    granted = _request(daemon.SOCKET_PATH, "allocate_cores", num_of_cores=1)
+    granted = _request(daemon.SOCKET_PATH, "allocate_cores", pool="general", num_of_cores=1)
     assert "error" not in granted, granted
     assert granted["allocated_cores"] == "2"
     assert granted["total_available_cpus"] == 4

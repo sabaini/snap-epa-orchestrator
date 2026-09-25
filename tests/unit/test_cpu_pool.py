@@ -18,6 +18,7 @@ from epa_orchestrator.cpu_pool import (
     read_snap_cpu_pool,
     validate_snap_configuration,
 )
+from epa_orchestrator.schemas import CpuPoolName
 
 
 @pytest.mark.parametrize(
@@ -110,7 +111,7 @@ def test_unbounded_input_rejected_without_present_topology(value):
 
 @pytest.mark.parametrize(
     "failure,expected_source",
-    [("snapctl", "isolated"), ("isolated", "isolated"), ("configured", "configured")],
+    [("snapctl", "configured"), ("isolated", "isolated"), ("configured", "configured")],
 )
 def test_startup_pool_degrades_to_zero_capacity(mock_cpu_files, caplog, failure, expected_source):
     """Failed discovery keeps the daemon serving instead of aborting startup."""
@@ -123,7 +124,10 @@ def test_startup_pool_degrades_to_zero_capacity(mock_cpu_files, caplog, failure,
         value = None if failure == "isolated" else "nonsense"
         context = patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value=value)
     with context:
-        provider = load_startup_pool()
+        pools = load_startup_pool()
+        provider = pools.select(
+            CpuPoolName.ISOLATED if failure == "isolated" else CpuPoolName.GENERAL
+        )
     snapshot = provider.snapshot()
     assert snapshot.source == expected_source
     assert snapshot.configured_cpus == snapshot.eligible_cpus == frozenset()
@@ -136,7 +140,11 @@ def test_startup_pool_degrades_to_zero_capacity(mock_cpu_files, caplog, failure,
 def test_startup_pool_uses_configuration_when_readable(mock_cpu_files_empty):
     """The degradation path must not mask a usable configured pool."""
     with patch("epa_orchestrator.cpu_pool.read_snap_cpu_pool", return_value="2-4"):
-        assert load_startup_pool().snapshot().eligible_cpus == {2, 3, 4}
+        assert load_startup_pool().select(CpuPoolName.GENERAL).snapshot().eligible_cpus == {
+            2,
+            3,
+            4,
+        }
 
 
 def test_configured_mode_does_not_read_isolated(mock_cpu_files):
@@ -187,7 +195,7 @@ def test_snap_read_failure_is_not_default(failure):
 
 def test_hook_claim_validation(mock_cpu_files_empty, fresh_allocations_db, snap_pool_options):
     """A hook allows supersets/offline owners but rejects shrinking and empty input."""
-    fresh_allocations_db.allocate_cores("owner", "2-3")
+    fresh_allocations_db.allocate_cores("owner", "2-3", pool=CpuPoolName.GENERAL)
     before = fresh_allocations_db._state_store.read_all()
     mock_cpu_files_empty["online"].write_text("0-2")
     for value in ("2-4", "2-3"):
@@ -219,7 +227,7 @@ def test_hook_unchanged_pool_survives_topology_loss(
 ):
     """Refresh accepts a saved pool with unavailable owners; new input stays strict."""
     snap_pool_options["cpu-pool"] = "2-5"
-    fresh_allocations_db.allocate_cores("owner", "4-5")
+    fresh_allocations_db.allocate_cores("owner", "4-5", pool=CpuPoolName.GENERAL)
     validate_snap_configuration()
     before = fresh_allocations_db._state_store.read_all()
     if present_failure == "absent":

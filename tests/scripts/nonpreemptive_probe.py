@@ -40,6 +40,7 @@ class Probe:
     def __init__(self, args):
         """Initialize a probe without modifying the host."""
         self.args = args
+        self.pool = getattr(args, "pool", "isolated")
         self.workers = []
         self.report = {"status": "RUNNING", "started_at": utc_now(), "events": [], "checks": []}
 
@@ -61,7 +62,13 @@ class Probe:
 
     def request(self, action, owner=OWNERS[0], **fields):
         """Send one JSON request, recording even daemon error responses."""
-        payload = {"version": "1.0", "action": action, "service_name": owner, **fields}
+        payload = {
+            "version": "1.0",
+            "action": action,
+            "service_name": owner,
+            "pool": self.pool,
+            **fields,
+        }
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(10)
             connection.connect(str(self.args.socket))
@@ -71,6 +78,8 @@ class Probe:
                 chunks.append(chunk)
         response = json.loads(b"".join(chunks))
         self.report["events"].append({"time": utc_now(), "request": payload, "response": response})
+        if "error" not in response:
+            assert response.get("pool") == self.pool, response
         return response
 
     def allocations(self):
@@ -78,6 +87,8 @@ class Probe:
         result = self.request("list_allocations")
         assert "error" not in result, result
         assert "non-preemptive-allocations" in result.get("supported_cpu_features", []), result
+        assert "cpu-pools" in result.get("supported_cpu_features", []), result
+        assert result.get("pool") == self.pool, result
         return {entry["service_name"]: entry for entry in result["allocations"]}
 
     def wait_for_allocations(self, timeout=15):
@@ -286,6 +297,7 @@ def main():
     )
     parser.add_argument("--snap-name", default="epa-orchestrator")
     parser.add_argument("--numa-node", type=int, default=0)
+    parser.add_argument("--pool", choices=("isolated", "general"), default="isolated")
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()

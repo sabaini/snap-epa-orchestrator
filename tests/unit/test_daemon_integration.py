@@ -1050,7 +1050,7 @@ def test_zero_capacity_lists_claims_and_support(policy_api, monkeypatch):
     # Online eligibility refreshes even though the configured choice is frozen.
     monkeypatch.setattr("epa_orchestrator.cpu_pool.read_cpu_list", lambda path: frozenset())
     result = policy_api("list_allocations")
-    assert result["supported_cpu_features"] == ["non-preemptive-allocations"]
+    assert result["supported_cpu_features"] == ["non-preemptive-allocations", "cpu-pools"]
     assert result["total_available_cpus"] == 0
     assert result["remaining_available_cpus"] == 0
     assert result["allocations"][0]["allocated_cores"] == "0-1"

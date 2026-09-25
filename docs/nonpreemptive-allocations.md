@@ -13,13 +13,16 @@ allocation before checking support**, and do not infer support from version 1.0.
 1. Send `{"version":"1.0","action":"list_allocations"}`. Require
    `supported_cpu_features` to contain `non-preemptive-allocations`. This field is
    present even with zero eligible CPUs. Missing capability means unsupported:
-   fail/block rather than fall back to an ordinary allocation.
+   fail/block rather than fall back to an ordinary allocation. For general CPUs,
+   also require `cpu-pools`, then inspect `list_allocations` with `pool: "general"`.
+   An unavailable pool is an error; do not fall back to isolated CPUs.
 2. Use a stable, distinct `service_name` for each independently managed OSD (for
    example `ceph-osd.0`). EPA retains the existing caller-supplied identity model;
    it does not authenticate entitlement to that name.
-3. Request `preemption_policy: "non-preemptive"`. Require a non-error response
+3. Request `preemption_policy: "non-preemptive"` and the selected `pool`. Require a non-error response
    with **exactly** `preemption_policy: "non-preemptive"` before applying returned
-   IDs. A missing or different confirmation is unsupported, not success. Do not
+   IDs. Also require the response `pool` to match the selected pool.
+   A missing or different confirmation is unsupported, not success. Do not
    apply those IDs; explicitly release the newly created claim after ensuring no
    workload uses it. Do not blindly release an existing live claim during error
    handling: reconcile the service's previous and observed state first.
@@ -37,6 +40,9 @@ allocation before checking support**, and do not infer support from version 1.0.
 This repository does not contain the Ceph charm/client implementation. These are
 integration requirements for that external client, not a claim it is updated.
 
+The examples below require a configured general pool. Use `pool: "isolated"`
+for isolated CPUs; omitting the selector also always means isolated.
+
 ### Count-only protection
 
 ```json
@@ -44,6 +50,7 @@ integration requirements for that external client, not a claim it is updated.
   "version": "1.0",
   "action": "allocate_cores",
   "service_name": "ceph-osd.0",
+  "pool": "general",
   "num_of_cores": 4,
   "preemption_policy": "non-preemptive"
 }
@@ -56,6 +63,7 @@ integration requirements for that external client, not a claim it is updated.
   "version": "1.0",
   "action": "allocate_numa_cores",
   "service_name": "ceph-osd.0",
+  "pool": "general",
   "numa_node": 0,
   "num_of_cores": 4,
   "preemption_policy": "non-preemptive"
@@ -63,20 +71,23 @@ integration requirements for that external client, not a claim it is updated.
 ```
 
 For percentage allocation, use `action: "allocate_cores_percent"`, `percent: 50`,
-and the same policy. Percentages remain ceiling-rounded against the complete eligible
+and the same pool and policy. Percentages remain ceiling-rounded against the complete eligible
 pool (`configured ∩ online`), not the free subset.
 Count/percentage responses use `allocated_cores`; NUMA uses `cores_allocated`.
 All three confirm the effective policy in `preemption_policy`.
 
 ## Policy and compatibility rules
 
+- Pool selection does not imply ownership protection. General and isolated pools
+  share one transactional ownership ledger; a service must fully release in its
+  original pool before switching. Listing and releases use the selected pool.
 - New services default to `legacy`. Omitting the field on an existing service
   inherits its policy across all three allocation APIs.
 - A successful upgrade protects **all** the service's claims, across NUMA nodes.
   Failed upgrades change neither policy nor claims. Downgrading a protected
   service with claims is rejected; fully release it first.
 - Non-preemptive requests cannot reclaim *any* other owner's CPUs, even ordinary
-  legacy claims. Legacy NUMA requests can still reclaim ordinary legacy CPUs but
+  legacy claims. Legacy NUMA requests can still reclaim ordinary legacy CPUs in the same pool but
   not explicit NUMA CPUs or any protected service's CPUs. Count/percentage
   requests never reclaim foreign ownership.
 - Protected retries retain eligible own IDs; growth keeps own IDs first and uses
@@ -85,7 +96,7 @@ All three confirm the effective policy in `preemption_policy`.
 - `is_explicit` retains its old meaning (NUMA metadata); it is not a protection
   indicator. Listing entries separately include `preemption_policy`.
 - `num_of_cores: -1` releases the whole service for ordinary requests, or only
-  the selected node for NUMA requests. Percentage `0`/`-1` releases the service.
+  the selected node for NUMA requests, always within the selected pool. Percentage `0`/`-1` releases the service.
   Partial release reports the remaining policy; full release reports JSON `null`
   and removes policy metadata. A later allocation is a new service allocation.
 - Unavailable/out-of-pool claimed CPUs remain owned and listed, even if eligible
@@ -94,8 +105,8 @@ All three confirm the effective policy in `preemption_policy`.
   when no CPUs are currently eligible.
 - Missing policy metadata in old state means legacy. Malformed metadata is a
   state error, never an implicit downgrade.
-- **Downgrading EPA to an old binary is incompatible while protected claims
-  exist.** Old binaries may discard policy metadata and reclaim CPUs. Coordinate
+- **Downgrading EPA to an old binary is incompatible while protected or general-pool
+  claims exist.** Old binaries may discard policy metadata and reclaim CPUs. Coordinate
   workload stop/release before a revert; a state version field cannot make an
   already shipped old binary enforce protection.
 
@@ -150,7 +161,7 @@ sudo python3 tests/scripts/nonpreemptive_probe.py \
   --output-dir /root/nonpreemptive-evidence
 ```
 
-`--socket`, `--state`, `--snap-name`, and `--numa-node` are configurable. Evidence
+`--socket`, `--state`, `--snap-name`, `--pool`, and `--numa-node` are configurable. Evidence
 includes API transcript, source identifier and installed Python hashes, snap
 metadata, kernel setup, protected and final state, affinity observations, and
 journal output.
@@ -161,5 +172,5 @@ legacy reclamation control, and immutable-state errors for both new allocation
 and replacement of an existing protected claim. Unit tests additionally inject
 post-replacement fsync failures, recovery failures, and concurrent DB requests.
 The probe discovers the active eligible pool through `list_allocations.cpu_pool`,
-so it also works without isolated CPUs after configuring `cpu-pool` and restarting
-the daemon.
+so it also works without isolated CPUs after configuring `cpu-pool`, restarting
+the daemon, and passing `--pool general`. The default is `--pool isolated`.

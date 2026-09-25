@@ -10,7 +10,7 @@ import pytest
 
 from epa_orchestrator.allocations_db import AllocationsDB, allocations_db
 from epa_orchestrator.cpu_pool import (
-    CpuPoolProvider,
+    CpuPools,
     load_startup_pool,
     validate_snap_configuration,
 )
@@ -28,13 +28,13 @@ def pool(mock_cpu_files_empty):
         patch("epa_orchestrator.utils.get_numa_node_cpus", return_value={0: set(range(8))}),
         patch("epa_orchestrator.cpu_pinning._read_file_strict", return_value="0-7"),
     ):
-        yield CpuPoolProvider("2-5")
+        yield CpuPools("2-5")
 
 
-def request(pool, action="allocate_cores", service="owner", **kwargs):
+def request(provider, action="allocate_cores", service="owner", **kwargs):
     """Send an API request with a test provider, requiring no snapd access."""
-    payload = {"action": action, "service_name": service, **kwargs}
-    return json.loads(handle_daemon_request(json.dumps(payload).encode(), pool))
+    payload = {"action": action, "service_name": service, "pool": "general", **kwargs}
+    return json.loads(handle_daemon_request(json.dumps(payload).encode(), provider))
 
 
 @pytest.mark.parametrize(
@@ -61,7 +61,7 @@ def test_percentage_capacity_not_free_and_single_snapshot(pool):
     """Percentage uses full eligible capacity and one snapshot, even with other owners."""
     request(pool, service="first", num_of_cores=3)
     before = allocations_db._state_store.read_all()
-    with patch.object(pool, "snapshot", wraps=pool.snapshot) as snapshot:
+    with patch.object(pool.general, "snapshot", wraps=pool.general.snapshot) as snapshot:
         result = request(pool, "allocate_cores_percent", service="second", percent=50)
         snapshot.assert_called_once()
     assert "Requested: 2, Available: 1" in result["error"]
@@ -111,8 +111,8 @@ def test_empty_pool_keeps_ledger_and_allows_release(pool, mock_cpu_files_empty, 
 
 def test_pool_conflict_startup_race_and_recovery(pool, caplog):
     """Claims made after hook validation block grants after restart, not releases."""
-    pending = CpuPoolProvider("4-5")
-    pending.validate_claims(allocations_db.get_claimed_cpus())
+    pending = CpuPools("4-5")
+    pending.general.validate_claims(allocations_db.get_claimed_cpus())
     request(pool, num_of_cores=2)  # active daemon grants CPUs after configure hook
     validate_startup_pool(pending)
     assert "New CPU allocations blocked" in caplog.text
@@ -129,13 +129,14 @@ def test_pool_conflict_startup_race_and_recovery(pool, caplog):
     assert request(pending, num_of_cores=1)["allocated_cores"] == "4"
 
 
-def test_default_empty_pool_keeps_owners(pool):
-    """Reverting to empty isolation keeps claims visible and releasable."""
+def test_unconfigured_general_keeps_owners(pool):
+    """Disabling a pool cannot redirect requests or release its claims through the default."""
     request(pool, num_of_cores=1)
-    default = CpuPoolProvider()
-    assert request(default, "list_allocations")["total_allocations"] == 1
-    assert "error" not in request(default, num_of_cores=-1)
-    assert request(default, num_of_cores=1)["error"] == "No CPUs available"
+    default = CpuPools()
+    assert "not configured" in request(default, "list_allocations")["error"]
+    assert "switching pools" in request(default, num_of_cores=-1, pool="isolated")["error"]
+    assert allocations_db.get_allocation("owner") == "2"
+    assert "error" not in request(pool, num_of_cores=-1)
 
 
 def test_missing_numa_topology_full_release(pool):
@@ -163,13 +164,13 @@ def test_selected_cpu_offlines_before_grant(pool, mock_cpu_files_empty, action, 
     # NUMA selection can displace this ordinary owner; no mutation is allowed on failure.
     request(pool, service="other", num_of_cores=1)
     before = allocations_db._state_store.read_all()
-    original_check = pool.check_online
+    original_check = pool.general.check_online
 
     def offline_then_check(selected):
         mock_cpu_files_empty["online"].write_text("0-1,6-7")
         original_check(selected)
 
-    with patch.object(pool, "check_online", side_effect=offline_then_check):
+    with patch.object(pool.general, "check_online", side_effect=offline_then_check):
         result = request(pool, action, **params)
     assert "retry" in result["error"]
     assert allocations_db._state_store.read_all() == before
@@ -189,13 +190,13 @@ def test_final_online_read_failure(pool, mock_cpu_files_empty, action, params):
     """An unreadable online file at the final check leaves all claims unchanged."""
     request(pool, num_of_cores=1)
     before = allocations_db._state_store.read_all()
-    original_check = pool.check_online
+    original_check = pool.general.check_online
 
     def remove_online_then_check(selected):
         mock_cpu_files_empty["online"].unlink()
         original_check(selected)
 
-    with patch.object(pool, "check_online", side_effect=remove_online_then_check):
+    with patch.object(pool.general, "check_online", side_effect=remove_online_then_check):
         result = request(pool, action, **params)
     assert "Failed to read CPU topology" in result["error"]
     assert allocations_db._state_store.read_all() == before
@@ -231,7 +232,7 @@ def test_mixed_sibling_read_failure_grants_exact_count(
     monkeypatch.setattr(
         "epa_orchestrator.daemon_handler.get_numa_node_cpus", lambda: {0: {0, 1, 2}}
     )
-    provider = CpuPoolProvider("0-2")
+    provider = CpuPools("0-2")
     result = request(provider, action, preemption_policy="non-preemptive", **params)
     assert "error" not in result, result
     assert result[field] == "0-2"
@@ -274,7 +275,7 @@ def test_retained_protected_cpus_skip_topology_but_validate_and_commit(
     params = {"num_of_cores": count, **({"numa_node": 0} if numa else {})}
     with (
         patch("epa_orchestrator.allocations_db.get_thread_siblings_map") as topology,
-        patch.object(pool, "check_online", wraps=pool.check_online) as online,
+        patch.object(pool.general, "check_online", wraps=pool.general.check_online) as online,
     ):
         result = request(pool, action, **params)
         assert "error" not in result, result
@@ -282,7 +283,7 @@ def test_retained_protected_cpus_skip_topology_but_validate_and_commit(
         online.assert_called_once_with(set(range(2, 2 + count)))
     assert AllocationsDB().get_allocation("owner") == ("2" if count == 1 else "2-3")
     before = allocations_db._state_store.read_all()
-    with patch.object(pool, "check_online", side_effect=ValueError("offline; retry")):
+    with patch.object(pool.general, "check_online", side_effect=ValueError("offline; retry")):
         assert "offline" in request(pool, action, **params)["error"]
     with patch("epa_orchestrator.state_store.os.replace", side_effect=OSError("write failed")):
         assert "write failed" in request(pool, action, **params)["error"]
@@ -350,7 +351,7 @@ def test_zero_capacity_startup_still_lists_and_releases(pool, caplog):
     listing = request(degraded, "list_allocations")
     assert listing["total_available_cpus"] == 0
     assert listing["cpu_pool"] == {
-        "source": "isolated",
+        "source": "configured",
         "configured_cpus": "",
         "eligible_cpus": "",
         "unavailable_allocated_cpus": "2-3",
